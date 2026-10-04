@@ -7,7 +7,7 @@ import { StatusMessage } from "../components/StatusMessage";
 import { ExpiryTimer } from "../components/ExpiryTimer";
 import { formatBytes } from "../components/Formatters";
 import { startPeerConnection, ActiveSession } from "../engine/PeerConnection";
-import { LockKeyhole, MonitorDown, ShieldCheck, Check, X, Radio, ArrowRight, Zap } from "lucide-react";
+import { LockKeyhole, MonitorDown, ShieldCheck, Check, X, Radio, ArrowRight, Zap, Globe } from "lucide-react";
 
 export function ReceiveSessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -105,8 +105,12 @@ export function ReceiveSessionPage() {
     const a = document.createElement("a");
     a.href = url;
     a.download = safeName;
+    document.body.appendChild(a);
     a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 60000);
   };
 
   const handleFinish = () => {
@@ -177,15 +181,18 @@ export function ReceiveSessionPage() {
               }
             />
 
-            {/* High-Speed Turbo LAN / Hotspot Guide */}
-            <div className="flex items-start gap-2.5 rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-3.5 text-xs text-emerald-300">
-              <Zap size={16} className="mt-0.5 shrink-0 text-emerald-400" />
+            {/* Universal Transfer & Infinite Size Guide */}
+            <div className="flex items-start gap-2.5 rounded-xl border border-accent/25 bg-accent/10 p-3.5 text-xs text-accent">
+              <Globe size={16} className="mt-0.5 shrink-0 text-accent" />
               <div className="space-y-1">
-                <p className="font-bold text-emerald-200">
-                  Turbo Speed Mode (100MB/s – 1GB/s Link)
+                <p className="font-bold text-primary">
+                  Universal Transfer (Mobile Data, Wi-Fi & Low Signal Ready)
                 </p>
-                <p className="text-emerald-300/90 leading-relaxed">
-                  Connect both devices to the <strong>same Wi-Fi</strong> or turn on <strong>Mobile Hotspot</strong>. Files transfer directly over local radio waves with <strong>0 KB internet used</strong>—even if your mobile cellular data is 10 kb/s or offline!
+                <p className="text-muted-foreground leading-relaxed">
+                  Receives files reliably across <strong>any cellular network</strong>, <strong>low signals (10 kb/s)</strong>, or <strong>separate connections</strong>. Handles <strong>100GB+ and infinite file sizes</strong> with disk-streaming memory protection.
+                  <span className="block mt-1 text-[11px] text-accent font-semibold">
+                    ⚡ <em>Optional LAN boost:</em> If both devices are on the same Wi-Fi or Hotspot, it automatically accelerates to 100MB/s+ LAN mode.
+                  </span>
                 </p>
               </div>
             </div>

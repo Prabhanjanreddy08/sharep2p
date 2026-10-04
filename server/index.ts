@@ -8,7 +8,7 @@ import fs from "fs";
 
 /* ─── Config ─── */
 const PORT = parseInt(process.env.PORT || "3001", 10);
-const SESSION_TTL_MS = 10 * 60 * 1000; // 10 min
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours (supports 100GB+ / infinite file sizes and slow connections)
 const MAX_PAIR_ATTEMPTS = 30; // per minute per IP
 const CLEAN_INTERVAL_MS = 15_000;
 
@@ -133,7 +133,14 @@ function sessionPayload(s: Session) {
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
-    if (now - s.createdAt > SESSION_TTL_MS) destroySession(id);
+    const hasActiveWs =
+      (s.senderWs && s.senderWs.readyState === WebSocket.OPEN) ||
+      (s.receiverWs && s.receiverWs.readyState === WebSocket.OPEN);
+
+    // Only clean up idle sessions where neither party is connected and TTL passed
+    if (!hasActiveWs && now - s.createdAt > SESSION_TTL_MS) {
+      destroySession(id);
+    }
     // Burn after pickup
     if (s.lifedrop?.burnAfterPickup && s.lifedrop?.pickedUp) destroySession(id);
   }
@@ -387,10 +394,29 @@ wss.on("connection", (ws, req) => {
     session.senderWs.send(JSON.stringify({ type: "peer-connected" }));
   }
 
+  // Keep connection alive through proxies (Render, mobile NATs) with 20s ping
+  const keepAliveTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      clearInterval(keepAliveTimer);
+    }
+  }, 20_000);
+
   // Relay messages between sender & receiver
   ws.on("message", (data) => {
     try {
       const msgStr = data.toString();
+      session.createdAt = Date.now(); // Refresh session expiration on active communication
+
+      // Handle application-level ping/pong heartbeats
+      if (msgStr.includes('"type":"ping"') || msgStr.includes('"type": "ping"')) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pong" }));
+        }
+        return;
+      }
+
       const peer = role === "sender" ? session.receiverWs : session.senderWs;
       if (peer && peer.readyState === WebSocket.OPEN) {
         peer.send(msgStr);
@@ -401,6 +427,7 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
+    clearInterval(keepAliveTimer);
     const peer = role === "sender" ? session.receiverWs : session.senderWs;
     if (role === "sender") session.senderWs = null;
     else session.receiverWs = null;
@@ -411,6 +438,7 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("error", (err) => {
+    clearInterval(keepAliveTimer);
     console.error(`WebSocket error (${role}):`, err.message);
   });
 });
