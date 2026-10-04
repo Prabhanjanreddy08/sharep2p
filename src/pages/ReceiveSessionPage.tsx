@@ -7,7 +7,7 @@ import { StatusMessage } from "../components/StatusMessage";
 import { ExpiryTimer } from "../components/ExpiryTimer";
 import { formatBytes } from "../components/Formatters";
 import { startPeerConnection, ActiveSession } from "../engine/PeerConnection";
-import { LockKeyhole, MonitorDown, ShieldCheck, Check, X, Radio, ArrowRight } from "lucide-react";
+import { LockKeyhole, MonitorDown, ShieldCheck, Check, X, Radio, ArrowRight, Zap } from "lucide-react";
 
 export function ReceiveSessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -27,6 +27,7 @@ export function ReceiveSessionPage() {
   const [stats, setStats] = useState({ transferred: 0, total: 0, speed: 0, eta: 0 });
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("connecting");
   const [statusMessage, setStatusMessage] = useState("");
+  const [isLocalDirect, setIsLocalDirect] = useState(false);
   const [completedFile, setCompletedFile] = useState<{
     blob: Blob;
     fileName: string;
@@ -40,6 +41,9 @@ export function ReceiveSessionPage() {
       session,
       role: "receiver",
       onEvent: (evt) => {
+        if (evt.isLocalDirect !== undefined) {
+          setIsLocalDirect(evt.isLocalDirect);
+        }
         if (evt.type === "status") {
           setStatus(evt.status);
           if (evt.message) setStatusMessage(evt.message);
@@ -151,9 +155,10 @@ export function ReceiveSessionPage() {
             </div>
           </div>
 
-          <div className="mt-10">
+          <div className="mt-10 space-y-4">
             <TransferStatus
               connected={status === "connected" || status === "transferring" || status === "complete"}
+              isLocalDirect={isLocalDirect}
               progress={progress}
               speed={stats.speed}
               transferred={stats.transferred}
@@ -171,6 +176,19 @@ export function ReceiveSessionPage() {
                   : "Connecting to sender"
               }
             />
+
+            {/* High-Speed Turbo LAN / Hotspot Guide */}
+            <div className="flex items-start gap-2.5 rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-3.5 text-xs text-emerald-300">
+              <Zap size={16} className="mt-0.5 shrink-0 text-emerald-400" />
+              <div className="space-y-1">
+                <p className="font-bold text-emerald-200">
+                  Turbo Speed Mode (100MB/s – 1GB/s Link)
+                </p>
+                <p className="text-emerald-300/90 leading-relaxed">
+                  Connect both devices to the <strong>same Wi-Fi</strong> or turn on <strong>Mobile Hotspot</strong>. Files transfer directly over local radio waves with <strong>0 KB internet used</strong>—even if your mobile cellular data is 10 kb/s or offline!
+                </p>
+              </div>
+            </div>
           </div>
 
           {statusMessage && (

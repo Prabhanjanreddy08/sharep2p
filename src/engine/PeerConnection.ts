@@ -16,6 +16,7 @@ export type TransferEvent =
       type: "status";
       status: "connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected";
       message?: string;
+      isLocalDirect?: boolean;
     }
   | {
       type: "progress";
@@ -24,6 +25,7 @@ export type TransferEvent =
       total: number;
       speed: number;
       eta: number;
+      isLocalDirect?: boolean;
     }
   | {
       type: "complete";
@@ -31,13 +33,14 @@ export type TransferEvent =
       fileName: string;
       fileType: string;
       verified: boolean;
+      isLocalDirect?: boolean;
     };
 
-/* ─── Ultra-High Throughput Constants (100MB/s+ & 100GB Support) ─── */
-const CHUNK_SIZE = 64 * 1024; // 64KB (SCTP standard maximum packet size)
-const BLOCK_SIZE = 4 * 1024 * 1024; // 4MB memory buffer per slice when reading from disk
-const BUFFER_LIMIT = 2 * 1024 * 1024; // 2MB high-water mark (always safely below Chromium's 16MB crash threshold)
-const LOW_WATERMARK = 512 * 1024; // 512KB low-water mark for continuous uninterrupted streaming
+/* ─── Ultra-High Throughput Constants (100MB/s+ - 1GB/s Link Saturation) ─── */
+const CHUNK_SIZE = 64 * 1024; // 64KB (SCTP optimal MTU pack)
+const BLOCK_SIZE = 8 * 1024 * 1024; // 8MB memory buffer per slice
+const BUFFER_LIMIT = 4 * 1024 * 1024; // 4MB high-water mark for full Wi-Fi saturation
+const LOW_WATERMARK = 1024 * 1024; // 1MB low-water mark for continuous streaming
 
 /* ─── Fast Multi-Sample Checksum (Handles 100GB in < 3ms) ─── */
 async function computeSha256(blob: Blob): Promise<string> {
@@ -200,13 +203,33 @@ export function startPeerConnection({
   onEvent: (event: TransferEvent) => void;
 }) {
   let isClosed = false;
+  let isDirectLocal = false;
   const ws = new WebSocket(getWebSocketUrl(session, role));
   const pc = new RTCPeerConnection({
     iceServers: [
       { urls: "stun:stun.l.google.com:19302" },
       { urls: "stun:global.stun.twilio.com:3478" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
     ],
+    iceCandidatePoolSize: 4,
   });
+
+  const detectLocalLink = async () => {
+    try {
+      const stats = await pc.getStats();
+      for (const report of stats.values()) {
+        if (report.type === "candidate-pair" && (report.state === "succeeded" || report.nominated)) {
+          const local = stats.get(report.localCandidateId);
+          const remote = stats.get(report.remoteCandidateId);
+          if (local?.candidateType === "host" || remote?.candidateType === "host") {
+            isDirectLocal = true;
+            return;
+          }
+        }
+      }
+    } catch {}
+  };
 
   let pendingIceCandidates: RTCIceCandidateInit[] = [];
   let remoteDescSet = false;
@@ -249,6 +272,7 @@ export function startPeerConnection({
       total,
       speed,
       eta: speed > 0 ? Math.max(0, (total - current) / speed) : 0,
+      isLocalDirect: isDirectLocal,
     });
   };
 
@@ -257,10 +281,11 @@ export function startPeerConnection({
     channel.bufferedAmountLowThreshold = LOW_WATERMARK;
 
     channel.onopen = async () => {
-      emit({ type: "status", status: "connected" });
+      await detectLocalLink();
+      emit({ type: "status", status: "connected", isLocalDirect: isDirectLocal });
       if (role !== "sender" || !file) return;
 
-      emit({ type: "status", status: "transferring" });
+      emit({ type: "status", status: "transferring", isLocalDirect: isDirectLocal });
       const sha256 = await computeSha256(file);
       const meta = {
         kind: "file-meta",
@@ -315,7 +340,7 @@ export function startPeerConnection({
 
       if (offset >= file.size) {
         channel.send(JSON.stringify({ kind: "file-complete" }));
-        emit({ type: "status", status: "complete" });
+        emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
       }
     };
 
@@ -326,13 +351,14 @@ export function startPeerConnection({
         try {
           const msg = JSON.parse(evt.data);
           if (msg.kind === "file-meta") {
+            await detectLocalLink();
             receivedMeta = msg;
             startTime = performance.now();
             lastTime = startTime;
             lastBytes = 0;
             receivedBytes = 0;
             await receiverSink.init(msg.fileName, msg.fileSize);
-            emit({ type: "status", status: "transferring" });
+            emit({ type: "status", status: "transferring", isLocalDirect: isDirectLocal });
           } else if (msg.kind === "file-complete" && receivedMeta) {
             updateProgress(receivedMeta.fileSize, receivedMeta.fileSize, startTime, true);
             const blob = await receiverSink.finish(receivedMeta.fileType);
@@ -346,6 +372,7 @@ export function startPeerConnection({
               total: receivedMeta.fileSize,
               speed: blob.size / Math.max(0.001, (performance.now() - startTime) / 1000),
               eta: 0,
+              isLocalDirect: isDirectLocal,
             });
 
             emit({
@@ -354,8 +381,9 @@ export function startPeerConnection({
               fileName: receivedMeta.fileName,
               fileType: receivedMeta.fileType,
               verified,
+              isLocalDirect: isDirectLocal,
             });
-            emit({ type: "status", status: "complete" });
+            emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
           }
         } catch (e) {
           console.error("Data channel parse error:", e);

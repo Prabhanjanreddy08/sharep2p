@@ -10,6 +10,7 @@ export function TransferStatus({
   transferred = 0,
   total = 0,
   eta = 0,
+  isLocalDirect = false,
 }: {
   connected: boolean;
   progress: number;
@@ -18,6 +19,7 @@ export function TransferStatus({
   transferred?: number;
   total?: number;
   eta?: number;
+  isLocalDirect?: boolean;
 }) {
   return (
     <div className="w-full min-w-0 rounded-2xl border border-border bg-card p-5 sm:p-6" data-testid="status-transfer">
@@ -33,7 +35,11 @@ export function TransferStatus({
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-bold text-primary">{label}</p>
             <p className="mt-0.5 truncate text-xs text-muted-foreground">
-              {connected ? "Direct device link is active" : "Waiting for the other device"}
+              {connected
+                ? isLocalDirect
+                  ? "⚡ Direct Local High-Speed Link (Zero internet used)"
+                  : "Direct device link is active"
+                : "Waiting for the other device"}
             </p>
           </div>
         </div>

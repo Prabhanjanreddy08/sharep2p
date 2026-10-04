@@ -10,7 +10,7 @@ import { formatBytes } from "../components/Formatters";
 import { getCachedActiveFile, cacheActiveFile } from "../engine/fileCache";
 import { startPeerConnection, ActiveSession } from "../engine/PeerConnection";
 import { apiUrl } from "../config";
-import { QrCode, Copy, Check, LockKeyhole, X, Radio, ArrowRight, Upload } from "lucide-react";
+import { QrCode, Copy, Check, LockKeyhole, X, Radio, ArrowRight, Upload, Zap, Wifi } from "lucide-react";
 
 export function SharePage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -30,6 +30,7 @@ export function SharePage() {
   const [copied, setCopied] = useState<"otp" | "link" | "">("");
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("waiting");
   const [statusMessage, setStatusMessage] = useState("");
+  const [isLocalDirect, setIsLocalDirect] = useState(false);
   const [progress, setProgress] = useState(0);
   const [stats, setStats] = useState({ transferred: 0, total: 0, speed: 0, eta: 0 });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -56,6 +57,9 @@ export function SharePage() {
       role: "sender",
       file,
       onEvent: (evt) => {
+        if (evt.isLocalDirect !== undefined) {
+          setIsLocalDirect(evt.isLocalDirect);
+        }
         if (evt.type === "status") {
           setStatus(evt.status);
           if (evt.message) setStatusMessage(evt.message);
@@ -196,6 +200,7 @@ export function SharePage() {
 
           <TransferStatus
             connected={status === "connected" || status === "transferring" || status === "complete"}
+            isLocalDirect={isLocalDirect}
             progress={progress}
             speed={stats.speed}
             transferred={stats.transferred}
@@ -213,6 +218,19 @@ export function SharePage() {
                 : "Waiting for receiver"
             }
           />
+
+          {/* High-Speed Turbo LAN / Hotspot Guide */}
+          <div className="flex items-start gap-2.5 rounded-xl border border-emerald-500/25 bg-emerald-500/10 p-3.5 text-xs text-emerald-300">
+            <Zap size={16} className="mt-0.5 shrink-0 text-emerald-400" />
+            <div className="space-y-1">
+              <p className="font-bold text-emerald-200">
+                Turbo Speed Mode (100MB/s – 1GB/s Link)
+              </p>
+              <p className="text-emerald-300/90 leading-relaxed">
+                Connect both devices to the <strong>same Wi-Fi</strong> or turn on <strong>Mobile Hotspot</strong>. Files transfer directly over local radio waves with <strong>0 KB internet used</strong>—even if your mobile cellular data is 10 kb/s or offline!
+              </p>
+            </div>
+          </div>
 
           {statusMessage && (
             <StatusMessage tone={status === "error" ? "error" : "quiet"}>

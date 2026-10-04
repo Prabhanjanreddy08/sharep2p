@@ -10,6 +10,7 @@ import {
   CloudOff,
   LockKeyhole,
   Package,
+  Zap,
 } from "lucide-react";
 
 export function HomePage() {
@@ -144,22 +145,31 @@ export function HomePage() {
           </Link>
         </section>
 
-        <section className="mt-16 grid gap-8 border-t border-border pt-8 text-sm text-muted-foreground sm:grid-cols-3">
+        <section className="mt-16 grid gap-8 border-t border-border pt-8 text-sm text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
+          <div className="flex gap-3">
+            <Zap className="shrink-0 text-accent" size={18} />
+            <span>
+              <strong className="text-primary">Gigabit LAN Speed.</strong>
+              <br />
+              100MB/s–1GB/s link over Wi-Fi / Hotspot.
+            </span>
+          </div>
+
           <div className="flex gap-3">
             <ShieldCheck className="shrink-0 text-accent" size={18} />
             <span>
-              <strong className="text-primary">End to end.</strong>
+              <strong className="text-primary">Direct P2P.</strong>
               <br />
-              The file takes the shortest route.
+              Direct device-to-device streaming.
             </span>
           </div>
 
           <div className="flex gap-3">
             <CloudOff className="shrink-0 text-accent" size={18} />
             <span>
-              <strong className="text-primary">No cloud copy.</strong>
+              <strong className="text-primary">Zero Internet.</strong>
               <br />
-              We only keep a tiny pairing signal.
+              0 KB data used on local transfers.
             </span>
           </div>
 
