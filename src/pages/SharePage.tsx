@@ -34,6 +34,8 @@ export function SharePage() {
   const [progress, setProgress] = useState(0);
   const [stats, setStats] = useState({ transferred: 0, total: 0, speed: 0, eta: 0 });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const progressRef = useRef(0);
+  const statusRef = useRef(status);
 
   useEffect(() => {
     getCachedActiveFile().then((cached) => {
@@ -45,11 +47,13 @@ export function SharePage() {
     if (!session) return;
     if (!file) {
       setStatus("error");
+      statusRef.current = "error";
       setStatusMessage("The selected file was cleared on page reload. Re-select it below to resume sharing.");
       return;
     }
 
     setStatus("waiting");
+    statusRef.current = "waiting";
     setStatusMessage("");
 
     const client = startPeerConnection({
@@ -61,10 +65,21 @@ export function SharePage() {
           setIsLocalDirect(evt.isLocalDirect);
         }
         if (evt.type === "status") {
+          // If transfer already reached 100% or complete, NEVER overwrite with error or disconnect!
+          if (progressRef.current === 100 || statusRef.current === "complete") {
+            console.log("SharePage ignoring status change after transfer completion:", evt.status);
+            return;
+          }
           setStatus(evt.status);
+          statusRef.current = evt.status;
           if (evt.message) setStatusMessage(evt.message);
         } else if (evt.type === "progress") {
           setProgress(evt.progress);
+          progressRef.current = evt.progress;
+          if (evt.progress === 100) {
+            setStatus("complete");
+            statusRef.current = "complete";
+          }
           setStats({
             transferred: evt.transferred,
             total: evt.total,
@@ -235,7 +250,7 @@ export function SharePage() {
             </div>
           </div>
 
-          {statusMessage && (
+          {statusMessage && status !== "complete" && progress !== 100 && (
             <StatusMessage tone={status === "error" ? "error" : "quiet"}>
               <Radio size={14} className="mt-0.5 shrink-0" />
               <div className="min-w-0 flex-1">

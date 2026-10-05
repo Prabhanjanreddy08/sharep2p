@@ -29,6 +29,7 @@ export function ReceiveSessionPage() {
   const [statusMessage, setStatusMessage] = useState("");
   const [isLocalDirect, setIsLocalDirect] = useState(false);
   const [downloadTriggered, setDownloadTriggered] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [completedFile, setCompletedFile] = useState<{
     blob: Blob;
     fileName: string;
@@ -42,27 +43,21 @@ export function ReceiveSessionPage() {
   } | null>(null);
   const progressRef = useRef(0);
 
-  const triggerDownload = (blob: Blob, fileName: string) => {
+  // Generate a stable download URL when file is ready; revoked only on unmount
+  useEffect(() => {
+    if (!completedFile) return;
     try {
-      const safeName = fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.style.display = "none";
-      a.href = url;
-      a.download = safeName;
-      document.body.appendChild(a);
-      a.click();
-      setDownloadTriggered(true);
-      setTimeout(() => {
+      const url = URL.createObjectURL(completedFile.blob);
+      setDownloadUrl(url);
+      return () => {
         try {
-          document.body.removeChild(a);
           URL.revokeObjectURL(url);
         } catch {}
-      }, 120_000);
+      };
     } catch (e) {
-      console.error("Download trigger error:", e);
+      console.error("Error creating download URL:", e);
     }
-  };
+  }, [completedFile]);
 
   useEffect(() => {
     if (!session) return;
@@ -104,8 +99,7 @@ export function ReceiveSessionPage() {
           progressRef.current = 100;
           setStatusMessage("Transfer complete! File is ready on this device.");
 
-          // Automatically trigger download directly to device
-          triggerDownload(fileData.blob, fileData.fileName);
+          // DO NOT automatically download: keep screen stable and let the user tap Save
         }
       },
     });
@@ -143,9 +137,36 @@ export function ReceiveSessionPage() {
     );
   }
 
-  const handleSave = () => {
+  const handleSaveClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
     if (!completedFile) return;
-    triggerDownload(completedFile.blob, completedFile.fileName);
+    const safeName = completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
+
+    // Desktop Chrome / Edge: showSaveFilePicker streams directly without memory overhead
+    if (typeof (window as any).showSaveFilePicker === "function") {
+      e.preventDefault();
+      try {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: safeName,
+        });
+        const writable = await handle.createWritable();
+        if (typeof (completedFile.blob as any).stream === "function") {
+          await (completedFile.blob as any).stream().pipeTo(writable);
+        } else {
+          await writable.write(completedFile.blob);
+          await writable.close();
+        }
+        setDownloadTriggered(true);
+        return;
+      } catch (err: any) {
+        if (err.name === "AbortError") return; // User cancelled
+        // Fallback to normal anchor click
+        if (downloadUrl) {
+          window.open(downloadUrl, "_self");
+        }
+      }
+    }
+    // Mobile browsers (Android/iOS): Native <a> tag download runs directly from user's screen tap
+    setDownloadTriggered(true);
   };
 
   const handleFinish = () => {
@@ -244,17 +265,18 @@ export function ReceiveSessionPage() {
 
           {completedFile && (
             <div className="mt-5 space-y-3">
-              <button
-                type="button"
-                onClick={handleSave}
-                className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg"
+              <a
+                href={downloadUrl || "#"}
+                download={completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download"}
+                onClick={handleSaveClick}
+                className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg active:scale-[0.99] cursor-pointer"
                 data-testid="button-save-file"
               >
                 <MonitorDown size={16} /> Save to this device {downloadTriggered ? "(Download again)" : ""}
-              </button>
+              </a>
               {downloadTriggered && (
                 <p className="text-center font-mono-ui text-[11px] text-emerald-400">
-                  ✓ Download started automatically in your browser!
+                  ✓ Download initiated! Check your browser’s downloads or notification bar.
                 </p>
               )}
             </div>

@@ -61,33 +61,28 @@ export function LifeDropReceivePage() {
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("connecting");
   const [statusMessage, setStatusMessage] = useState("");
   const [downloadTriggered, setDownloadTriggered] = useState(false);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [completedFile, setCompletedFile] = useState<{ blob: Blob; fileName: string; verified: boolean } | null>(null);
   const [copiedId, setCopiedId] = useState("");
 
   const completedFileRef = useRef<{ blob: Blob; fileName: string; verified: boolean } | null>(null);
   const progressRef = useRef(0);
 
-  const triggerDownload = (blob: Blob, fileName: string) => {
+  // Generate a stable download URL when file is ready; revoked only on unmount
+  useEffect(() => {
+    if (!completedFile) return;
     try {
-      const safeName = fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.style.display = "none";
-      a.href = url;
-      a.download = safeName;
-      document.body.appendChild(a);
-      a.click();
-      setDownloadTriggered(true);
-      setTimeout(() => {
+      const url = URL.createObjectURL(completedFile.blob);
+      setDownloadUrl(url);
+      return () => {
         try {
-          document.body.removeChild(a);
           URL.revokeObjectURL(url);
         } catch {}
-      }, 120_000);
+      };
     } catch (e) {
-      console.error("LifeDrop download error:", e);
+      console.error("LifeDrop download URL error:", e);
     }
-  };
+  }, [completedFile]);
 
   const fileItems = (session?.lifedrop?.items || []).filter((i) => i.kind === "file" || i.kind === "photo");
   const textItems = (session?.lifedrop?.items || []).filter((i) => i.kind !== "file" && i.kind !== "photo");
@@ -133,8 +128,7 @@ export function LifeDropReceivePage() {
           progressRef.current = 100;
           setStatusMessage("Transfer complete! File is ready on this device.");
 
-          // Automatically trigger download directly to device
-          triggerDownload(fileData.blob, fileData.fileName);
+          // DO NOT automatically download: keep screen stable and let the user tap Save
         }
       },
     });
@@ -171,9 +165,33 @@ export function LifeDropReceivePage() {
     );
   }
 
-  const handleSaveFile = () => {
+  const handleSaveFileClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
     if (!completedFile) return;
-    triggerDownload(completedFile.blob, completedFile.fileName);
+    const safeName = completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
+
+    if (typeof (window as any).showSaveFilePicker === "function") {
+      e.preventDefault();
+      try {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: safeName,
+        });
+        const writable = await handle.createWritable();
+        if (typeof (completedFile.blob as any).stream === "function") {
+          await (completedFile.blob as any).stream().pipeTo(writable);
+        } else {
+          await writable.write(completedFile.blob);
+          await writable.close();
+        }
+        setDownloadTriggered(true);
+        return;
+      } catch (err: any) {
+        if (err.name === "AbortError") return;
+        if (downloadUrl) {
+          window.open(downloadUrl, "_self");
+        }
+      }
+    }
+    setDownloadTriggered(true);
   };
 
   const handleCopyText = async (text: string, itemId: string) => {
@@ -318,16 +336,17 @@ export function LifeDropReceivePage() {
 
               {completedFile && (
                 <div className="mt-5 space-y-3">
-                  <button
-                    type="button"
-                    onClick={handleSaveFile}
-                    className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg"
+                  <a
+                    href={downloadUrl || "#"}
+                    download={completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download"}
+                    onClick={handleSaveFileClick}
+                    className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg active:scale-[0.99] cursor-pointer"
                   >
                     <Download size={16} /> Save file to this device {downloadTriggered ? "(Download again)" : ""}
-                  </button>
+                  </a>
                   {downloadTriggered && (
                     <p className="text-center font-mono-ui text-[11px] text-emerald-400">
-                      ✓ Download started automatically in your browser!
+                      ✓ Download initiated! Check your browser’s downloads or notification bar.
                     </p>
                   )}
                 </div>
