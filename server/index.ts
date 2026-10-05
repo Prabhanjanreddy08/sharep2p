@@ -34,6 +34,11 @@ interface Session {
   fileName: string;
   fileSize: number;
   fileType: string;
+  files?: Array<{
+    fileName: string;
+    fileSize: number;
+    fileType: string;
+  }>;
   signalingPath: string;
   expiresAt: string;
   createdAt: number;
@@ -113,6 +118,7 @@ function sessionPayload(s: Session) {
     fileName: s.fileName,
     fileSize: s.fileSize,
     fileType: s.fileType,
+    files: s.files,
     signalingPath: s.signalingPath,
     expiresAt: s.expiresAt,
     ...(s.lifedrop
@@ -163,24 +169,33 @@ app.get(["/api/health", "/api/healthz"], (_req, res) => {
   res.json({ status: "ok", ok: true, sessions: sessions.size, uptime: process.uptime() });
 });
 
-// Create session (sender) – original file share
+// Create session (sender) – supports single file or multiple files
 const handleCreateSession = (req: express.Request, res: express.Response) => {
   const ip = getIp(req);
   if (throttle(ip)) return res.status(429).json({ error: "Too many attempts" });
 
-  const { fileName, fileSize, fileType } = req.body || {};
+  const { fileName, fileSize, fileType, files } = req.body || {};
   const sessionId = generateId();
   const token = generateToken();
   const otp = generateOtp();
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
 
+  const sessionFiles = Array.isArray(files) && files.length > 0 ? files : undefined;
+  const computedTotalSize = sessionFiles
+    ? sessionFiles.reduce((acc: number, f: any) => acc + (typeof f.fileSize === "number" ? f.fileSize : 0), 0)
+    : (typeof fileSize === "number" ? fileSize : 0);
+  const computedFileName = sessionFiles
+    ? (sessionFiles.length === 1 ? sessionFiles[0].fileName : `${sessionFiles.length} files package`)
+    : (fileName || "Untitled file");
+
   const session: Session = {
     sessionId,
     token,
     otp,
-    fileName: fileName || "Untitled file",
-    fileSize: typeof fileSize === "number" ? fileSize : 0,
+    fileName: computedFileName,
+    fileSize: computedTotalSize,
     fileType: fileType || "application/octet-stream",
+    files: sessionFiles,
     signalingPath: `/api/ws/${sessionId}`,
     expiresAt,
     createdAt: Date.now(),

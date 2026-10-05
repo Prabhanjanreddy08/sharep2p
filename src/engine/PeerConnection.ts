@@ -7,8 +7,21 @@ export interface ActiveSession {
   fileName: string;
   fileSize: number;
   fileType: string;
+  files?: Array<{
+    fileName: string;
+    fileSize: number;
+    fileType: string;
+  }>;
   signalingPath: string;
   expiresAt: string;
+}
+
+export interface ReceivedFile {
+  blob: Blob;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  verified: boolean;
 }
 
 export type TransferEvent =
@@ -25,14 +38,25 @@ export type TransferEvent =
       total: number;
       speed: number;
       eta: number;
+      currentFileName?: string;
+      fileIndex?: number;
+      totalFiles?: number;
+      isLocalDirect?: boolean;
+    }
+  | {
+      type: "file-complete";
+      file: ReceivedFile;
+      fileIndex: number;
+      totalFiles: number;
       isLocalDirect?: boolean;
     }
   | {
       type: "complete";
-      blob: Blob;
-      fileName: string;
-      fileType: string;
+      blob?: Blob;
+      fileName?: string;
+      fileType?: string;
       verified: boolean;
+      files?: ReceivedFile[];
       isLocalDirect?: boolean;
     };
 
@@ -54,27 +78,11 @@ function releaseWakeLock() {
   }
 }
 
-/* ─── Streaming Constants (Adaptive for 10 kb/s up to 1GB/s Link) ─── */
-const CHUNK_SIZE = 64 * 1024; // 64KB (optimal MTU pack for WebRTC SCTP)
-const BLOCK_SIZE = 4 * 1024 * 1024; // 4MB slice from File on sender (keeps RAM < 15MB)
-
-function getAdaptiveBufferLimit(speed: number): number {
-  if (speed <= 0 || speed < 200 * 1024) {
-    // Low network (< 200 KB/s, e.g. 10 kb/s cellular):
-    // Keep buffer strictly low (128KB) to avoid bloating the SCTP pipe and preventing timeouts
-    return 128 * 1024;
-  }
-  if (speed < 2 * 1024 * 1024) {
-    // Medium network (200 KB/s - 2 MB/s)
-    return 512 * 1024;
-  }
-  if (speed < 10 * 1024 * 1024) {
-    // Fast Wi-Fi (2 MB/s - 10 MB/s)
-    return 2 * 1024 * 1024;
-  }
-  // High-Speed Local LAN (Gigabit Link: 100MB/s+)
-  return 4 * 1024 * 1024;
-}
+/* ─── High-Throughput Gigabit WebRTC Pipeline (100MB/s - 1GB/s line rate) ─── */
+const CHUNK_SIZE = 64 * 1024; // 64KB per SCTP chunk
+const BLOCK_SIZE = 16 * 1024 * 1024; // 16MB block slices from File
+const MAX_BUFFER = 16 * 1024 * 1024; // 16MB SCTP buffer ceiling
+const LOW_THRESHOLD = 4 * 1024 * 1024; // 4MB threshold to unpause (keeps pipe permanently full)
 
 /* ─── Fast Multi-Sample Checksum (Handles 100GB in < 3ms without memory load) ─── */
 async function computeSha256(blob: Blob): Promise<string> {
@@ -111,7 +119,7 @@ function waitBufferedAmountLow(channel: RTCDataChannel, threshold: number): Prom
   if (channel.bufferedAmount <= threshold) return Promise.resolve();
 
   try {
-    channel.bufferedAmountLowThreshold = Math.min(threshold, 64 * 1024);
+    channel.bufferedAmountLowThreshold = threshold;
   } catch {}
 
   return new Promise((resolve) => {
@@ -130,13 +138,31 @@ function waitBufferedAmountLow(channel: RTCDataChannel, threshold: number): Prom
     const onLow = () => cleanup();
     channel.addEventListener("bufferedamountlow", onLow, { once: true });
 
-    // Active polling safety timer: checks every 20ms so it NEVER hangs indefinitely
+    // Active polling safety timer: checks every 2ms so SCTP pipeline never stalls
     timer = setInterval(() => {
       if (channel.readyState !== "open" || channel.bufferedAmount <= threshold) {
         cleanup();
       }
-    }, 20);
+    }, 2);
   });
+}
+
+/* ─── Adaptive Buffer Limiter: Saturates Gigabit LAN while Protecting Slow Links ─── */
+function getAdaptiveBufferLimit(speedBytesPerSec: number): number {
+  if (speedBytesPerSec > 50 * 1024 * 1024) {
+    return MAX_BUFFER; // 16MB
+  }
+  if (speedBytesPerSec > 10 * 1024 * 1024) {
+    return 8 * 1024 * 1024; // 8MB
+  }
+  if (speedBytesPerSec > 1 * 1024 * 1024) {
+    return 4 * 1024 * 1024; // 4MB
+  }
+  if (speedBytesPerSec > 100 * 1024) {
+    return 1024 * 1024; // 1MB
+  }
+  // Initial unthrottled burst: 2MB allows 1GB/s connections to accelerate immediately
+  return 2 * 1024 * 1024;
 }
 
 /* ─── Stream Sink: Writes Directly to Disk (OPFS + IndexedDB for 100GB+ / Infinite Files) ─── */
@@ -240,7 +266,7 @@ class StreamSink {
         this.pendingBytes = 0;
 
         // Store as disk-backed Blob in IndexedDB: Prevents memory exhaustion for 5GB+ files
-        const blobPart = new Blob(toWrite, { type: "application/octet-stream" });
+        const blobPart = new Blob(toWrite as any[], { type: "application/octet-stream" });
 
         this.writeQueue = this.writeQueue
           .then(() => {
@@ -288,14 +314,14 @@ class StreamSink {
         console.warn("OPFS close error:", err);
       }
       const file = await this.opfsFileHandle.getFile();
-      return file;
+      return file.slice(0, file.size, fileType || "application/octet-stream");
     } else if (this.useIdb && this.idbDb) {
       if (this.pendingBytes > 0) {
         const toWrite = this.pendingBuffer;
         const chunkIdx = this.idbChunkIndex++;
         this.pendingBuffer = [];
         this.pendingBytes = 0;
-        const blobPart = new Blob(toWrite, { type: "application/octet-stream" });
+        const blobPart = new Blob(toWrite as any[], { type: "application/octet-stream" });
 
         this.writeQueue = this.writeQueue
           .then(() => {
@@ -314,7 +340,7 @@ class StreamSink {
 
       // Read back all Blob handles from IndexedDB into a master Blob without loading bytes into active RAM
       return new Promise<Blob>((resolve, reject) => {
-        if (!this.idbDb) return resolve(new Blob([], { type: fileType }));
+        if (!this.idbDb) return resolve(new Blob([], { type: fileType || "application/octet-stream" }));
         const tx = this.idbDb.transaction("chunks", "readonly");
         const store = tx.objectStore("chunks");
         const chunks: BlobPart[] = [];
@@ -325,13 +351,13 @@ class StreamSink {
             chunks.push(cursor.value);
             cursor.continue();
           } else {
-            resolve(new Blob(chunks, { type: fileType }));
+            resolve(new Blob(chunks, { type: fileType || "application/octet-stream" }));
           }
         };
         req.onerror = () => reject(req.error);
       });
     } else {
-      return new Blob(this.memChunks, { type: fileType });
+      return new Blob(this.memChunks, { type: fileType || "application/octet-stream" });
     }
   }
 }
@@ -349,11 +375,13 @@ export function startPeerConnection({
   session,
   role,
   file,
+  files,
   onEvent,
 }: {
   session: ActiveSession;
   role: "sender" | "receiver";
   file?: File | Blob | null;
+  files?: File[] | null;
   onEvent: (event: TransferEvent) => void;
 }) {
   let isClosed = false;
@@ -363,6 +391,17 @@ export function startPeerConnection({
 
   // Keep mobile device screen awake during transfer
   requestWakeLock();
+
+  const filesToSend: File[] = [];
+  if (files && files.length > 0) {
+    filesToSend.push(...files);
+  } else if (file) {
+    filesToSend.push(file as File);
+  }
+  const totalTransferBytes =
+    filesToSend.length > 0
+      ? filesToSend.reduce((acc, f) => acc + f.size, 0)
+      : session.fileSize;
 
   const ws = new WebSocket(getWebSocketUrl(session, role));
 
@@ -404,9 +443,22 @@ export function startPeerConnection({
 
   let pendingIceCandidates: RTCIceCandidateInit[] = [];
   let remoteDescSet = false;
-  let receivedMeta: { fileName: string; fileSize: number; fileType: string; sha256: string } | null = null;
-  const receiverSink = new StreamSink();
-  let receivedBytes = 0;
+  let pendingFileAck: ((ackIdx: number) => void) | null = null;
+  const receivedFiles: ReceivedFile[] = [];
+  let currentSink: StreamSink | null = null;
+  let currentMeta: {
+    fileName: string;
+    fileSize: number;
+    fileType: string;
+    sha256: string;
+    fileIndex?: number;
+    totalFiles?: number;
+    totalTransferSize?: number;
+  } | null = null;
+  let totalBatchExpectedFiles = session.files?.length || 1;
+  let totalBatchExpectedBytes = session.fileSize;
+  let overallReceivedBytes = 0;
+
   let startTime = 0;
   let lastTime = 0;
   let lastBytes = 0;
@@ -430,7 +482,15 @@ export function startPeerConnection({
     }
   }, 15_000);
 
-  const updateProgress = (current: number, total: number, start: number, force = false): number => {
+  const updateProgress = (
+    current: number,
+    total: number,
+    start: number,
+    force = false,
+    currentFileName?: string,
+    fileIndex?: number,
+    totalFiles?: number
+  ): number => {
     const now = performance.now();
     if (!force && now - lastProgressEmit < 50) return currentSpeed;
     lastProgressEmit = now;
@@ -452,6 +512,9 @@ export function startPeerConnection({
       total,
       speed,
       eta: speed > 0 ? Math.max(0, (total - current) / speed) : 0,
+      currentFileName,
+      fileIndex,
+      totalFiles,
       isLocalDirect: isDirectLocal,
     });
 
@@ -465,76 +528,129 @@ export function startPeerConnection({
     channel.onopen = async () => {
       await detectLocalLink();
       emit({ type: "status", status: "connected", isLocalDirect: isDirectLocal });
-      if (role !== "sender" || !file) return;
+      if (role !== "sender" || filesToSend.length === 0) return;
 
       emit({ type: "status", status: "transferring", isLocalDirect: isDirectLocal });
-      const sha256 = await computeSha256(file);
-      const meta = {
-        kind: "file-meta",
-        fileName: (file as File).name || session.fileName,
-        fileSize: file.size,
-        fileType: file.type || "application/octet-stream",
-        chunkSize: CHUNK_SIZE,
-        sha256,
-      };
-      channel.send(JSON.stringify(meta));
+
+      if (channel.readyState === "open") {
+        channel.send(
+          JSON.stringify({
+            kind: "batch-meta",
+            totalFiles: filesToSend.length,
+            totalSize: totalTransferBytes,
+          })
+        );
+      }
 
       const sendStart = performance.now();
       lastTime = sendStart;
       lastBytes = 0;
-      let offset = 0;
+      let overallSent = 0;
 
-      while (offset < file.size && channel.readyState === "open") {
-        const blockEnd = Math.min(file.size, offset + BLOCK_SIZE);
-        const blockSlice = file.slice(offset, blockEnd);
-        const blockBuffer = await blockSlice.arrayBuffer();
+      for (let fileIdx = 0; fileIdx < filesToSend.length; fileIdx++) {
+        if (channel.readyState !== "open" || isClosed) break;
 
-        let blockOffset = 0;
-        while (blockOffset < blockBuffer.byteLength && channel.readyState === "open") {
-          // Dynamic adaptive buffering: Prevents buffer bloat on 10 kb/s while saturating Gigabit LAN
-          const maxBuffer = getAdaptiveBufferLimit(currentSpeed);
-          if (channel.bufferedAmount >= maxBuffer) {
-            await waitBufferedAmountLow(channel, Math.floor(maxBuffer / 2));
-          }
+        const currentFile = filesToSend[fileIdx];
+        const sha256 = await computeSha256(currentFile);
 
-          if (channel.readyState !== "open") break;
+        const meta = {
+          kind: "file-meta",
+          fileIndex: fileIdx,
+          totalFiles: filesToSend.length,
+          fileName: currentFile.name || session.fileName,
+          fileSize: currentFile.size,
+          fileType: currentFile.type || "application/octet-stream",
+          totalTransferSize: totalTransferBytes,
+          chunkSize: CHUNK_SIZE,
+          sha256,
+        };
+        channel.send(JSON.stringify(meta));
 
-          const chunkEnd = Math.min(blockBuffer.byteLength, blockOffset + CHUNK_SIZE);
-          const chunk = new Uint8Array(blockBuffer, blockOffset, chunkEnd - blockOffset);
+        let offset = 0;
+        while (offset < currentFile.size && channel.readyState === "open" && !isClosed) {
+          const blockEnd = Math.min(currentFile.size, offset + BLOCK_SIZE);
+          const blockSlice = currentFile.slice(offset, blockEnd);
+          const blockBuffer = await blockSlice.arrayBuffer();
 
-          // Resilient chunk sending with buffer recovery
-          let sent = false;
-          while (!sent && channel.readyState === "open") {
-            try {
-              channel.send(chunk);
-              sent = true;
-            } catch (err: any) {
-              console.warn("Buffer full, pausing briefly...", err);
-              await waitBufferedAmountLow(channel, 32 * 1024);
+          let blockOffset = 0;
+          while (blockOffset < blockBuffer.byteLength && channel.readyState === "open" && !isClosed) {
+            const maxBuffer = getAdaptiveBufferLimit(currentSpeed);
+            if (channel.bufferedAmount >= maxBuffer) {
+              await waitBufferedAmountLow(channel, Math.floor(maxBuffer / 2));
             }
+
+            if (channel.readyState !== "open" || isClosed) break;
+
+            const chunkEnd = Math.min(blockBuffer.byteLength, blockOffset + CHUNK_SIZE);
+            const chunk = new Uint8Array(blockBuffer, blockOffset, chunkEnd - blockOffset);
+
+            let sent = false;
+            while (!sent && channel.readyState === "open" && !isClosed) {
+              try {
+                channel.send(chunk);
+                sent = true;
+              } catch (err: any) {
+                console.warn("Buffer full, pausing briefly...", err);
+                await waitBufferedAmountLow(channel, 32 * 1024);
+              }
+            }
+
+            const sentLen = chunk.byteLength;
+            blockOffset += sentLen;
+            offset += sentLen;
+            overallSent += sentLen;
+            currentSpeed = updateProgress(
+              overallSent,
+              totalTransferBytes,
+              sendStart,
+              false,
+              currentFile.name,
+              fileIdx,
+              filesToSend.length
+            );
           }
-
-          const sentLen = chunk.byteLength;
-          blockOffset += sentLen;
-          offset += sentLen;
-          currentSpeed = updateProgress(offset, file.size, sendStart);
         }
-      }
 
-      updateProgress(file.size, file.size, sendStart, true);
-
-      if (offset >= file.size) {
         // Wait until all remaining chunks drain from the local network buffer
-        while (channel.bufferedAmount > 0 && channel.readyState === "open") {
+        while (channel.bufferedAmount > 0 && channel.readyState === "open" && !isClosed) {
           await waitBufferedAmountLow(channel, 0);
         }
-        if (channel.readyState === "open") {
-          channel.send(JSON.stringify({ kind: "file-complete" }));
+
+        if (channel.readyState === "open" && !isClosed) {
+          channel.send(
+            JSON.stringify({
+              kind: "file-complete",
+              fileIndex: fileIdx,
+              fileName: currentFile.name,
+            })
+          );
+
+          // Wait for receiver to acknowledge this file
+          await new Promise<void>((resolve) => {
+            const ackTimer = setTimeout(() => resolve(), 6000);
+            pendingFileAck = (ackIdx: number) => {
+              if (ackIdx === fileIdx) {
+                clearTimeout(ackTimer);
+                pendingFileAck = null;
+                resolve();
+              }
+            };
+          });
         }
-        isTransferComplete = true;
-        emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
-        releaseWakeLock();
       }
+
+      updateProgress(totalTransferBytes, totalTransferBytes, sendStart, true);
+
+      while (channel.bufferedAmount > 0 && channel.readyState === "open") {
+        await waitBufferedAmountLow(channel, 0);
+      }
+
+      if (channel.readyState === "open") {
+        channel.send(JSON.stringify({ kind: "all-complete" }));
+      }
+      isTransferComplete = true;
+      emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
+      releaseWakeLock();
     };
 
     channel.onmessage = async (evt) => {
@@ -542,7 +658,10 @@ export function startPeerConnection({
         if (typeof evt.data === "string") {
           try {
             const msg = JSON.parse(evt.data);
-            if (msg.kind === "file-ack") {
+            if (msg.kind === "file-ack" && pendingFileAck) {
+              pendingFileAck(msg.fileIndex);
+            }
+            if (msg.kind === "all-ack") {
               isTransferComplete = true;
               emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
             }
@@ -554,50 +673,105 @@ export function startPeerConnection({
       if (typeof evt.data === "string") {
         try {
           const msg = JSON.parse(evt.data);
-          if (msg.kind === "file-meta") {
+          if (msg.kind === "batch-meta") {
+            totalBatchExpectedFiles = msg.totalFiles || 1;
+            totalBatchExpectedBytes = msg.totalSize || session.fileSize;
+          } else if (msg.kind === "file-meta") {
             await detectLocalLink();
-            receivedMeta = msg;
-            startTime = performance.now();
-            lastTime = startTime;
-            lastBytes = 0;
-            receivedBytes = 0;
-            await receiverSink.init(msg.fileName, msg.fileSize);
+            currentMeta = msg;
+            if (msg.totalFiles) totalBatchExpectedFiles = msg.totalFiles;
+            if (msg.totalTransferSize) totalBatchExpectedBytes = msg.totalTransferSize;
+            if (!startTime) {
+              startTime = performance.now();
+              lastTime = startTime;
+              lastBytes = 0;
+            }
+            currentSink = new StreamSink();
+            await currentSink.init(msg.fileName, msg.fileSize);
             emit({ type: "status", status: "transferring", isLocalDirect: isDirectLocal });
-          } else if (msg.kind === "file-complete" && receivedMeta) {
-            updateProgress(receivedMeta.fileSize, receivedMeta.fileSize, startTime, true);
-            const blob = await receiverSink.finish(receivedMeta.fileType);
+            updateProgress(
+              overallReceivedBytes,
+              totalBatchExpectedBytes,
+              startTime,
+              false,
+              msg.fileName,
+              msg.fileIndex,
+              totalBatchExpectedFiles
+            );
+          } else if (msg.kind === "file-complete" && currentMeta && currentSink) {
+            const blob = await currentSink.finish(currentMeta.fileType);
             const computedSha = await computeSha256(blob);
-            const verified = blob.size === receivedMeta.fileSize && computedSha === receivedMeta.sha256;
+            const verified = blob.size === currentMeta.fileSize && computedSha === currentMeta.sha256;
 
-            isTransferComplete = true; // Protect against disconnect events
-
-            emit({
-              type: "progress",
-              progress: 100,
-              transferred: blob.size,
-              total: receivedMeta.fileSize,
-              speed: blob.size / Math.max(0.001, (performance.now() - startTime) / 1000),
-              eta: 0,
-              isLocalDirect: isDirectLocal,
-            });
-
-            emit({
-              type: "complete",
+            const recFile: ReceivedFile = {
               blob,
-              fileName: receivedMeta.fileName,
-              fileType: receivedMeta.fileType,
+              fileName: currentMeta.fileName,
+              fileType: currentMeta.fileType,
+              fileSize: blob.size,
               verified,
-              isLocalDirect: isDirectLocal,
-            });
-            emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
-            releaseWakeLock();
+            };
+            receivedFiles.push(recFile);
 
             // Send acknowledgment to sender
             try {
               if (channel.readyState === "open") {
-                channel.send(JSON.stringify({ kind: "file-ack" }));
+                channel.send(JSON.stringify({ kind: "file-ack", fileIndex: currentMeta.fileIndex }));
               }
             } catch {}
+
+            emit({
+              type: "file-complete",
+              file: recFile,
+              fileIndex: currentMeta.fileIndex ?? (receivedFiles.length - 1),
+              totalFiles: totalBatchExpectedFiles,
+              isLocalDirect: isDirectLocal,
+            });
+
+            if (totalBatchExpectedFiles <= 1 || receivedFiles.length >= totalBatchExpectedFiles) {
+              isTransferComplete = true;
+              updateProgress(
+                totalBatchExpectedBytes,
+                totalBatchExpectedBytes,
+                startTime,
+                true,
+                recFile.fileName,
+                receivedFiles.length - 1,
+                totalBatchExpectedFiles
+              );
+              emit({
+                type: "complete",
+                blob: receivedFiles[0]?.blob,
+                fileName: receivedFiles[0]?.fileName,
+                fileType: receivedFiles[0]?.fileType,
+                verified: receivedFiles.every((f) => f.verified),
+                files: receivedFiles,
+                isLocalDirect: isDirectLocal,
+              });
+              emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
+              releaseWakeLock();
+            }
+          } else if (msg.kind === "all-complete") {
+            isTransferComplete = true;
+            updateProgress(
+              totalBatchExpectedBytes,
+              totalBatchExpectedBytes,
+              startTime,
+              true,
+              receivedFiles[receivedFiles.length - 1]?.fileName,
+              receivedFiles.length - 1,
+              totalBatchExpectedFiles
+            );
+            emit({
+              type: "complete",
+              blob: receivedFiles[0]?.blob,
+              fileName: receivedFiles[0]?.fileName,
+              fileType: receivedFiles[0]?.fileType,
+              verified: receivedFiles.every((f) => f.verified),
+              files: receivedFiles,
+              isLocalDirect: isDirectLocal,
+            });
+            emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
+            releaseWakeLock();
           }
         } catch (e) {
           console.error("Data channel parse error:", e);
@@ -605,11 +779,21 @@ export function startPeerConnection({
         return;
       }
 
-      // Binary chunk: Process directly into stream sink (OPFS / IndexedDB)
-      const chunk = evt.data as ArrayBuffer;
-      receiverSink.write(chunk);
-      receivedBytes += chunk.byteLength;
-      updateProgress(receivedBytes, receivedMeta?.fileSize ?? session.fileSize, startTime || performance.now());
+      // Binary chunk: Process directly into currentSink (OPFS / IndexedDB)
+      if (currentSink) {
+        const chunk = evt.data as ArrayBuffer;
+        currentSink.write(chunk);
+        overallReceivedBytes += chunk.byteLength;
+        updateProgress(
+          overallReceivedBytes,
+          totalBatchExpectedBytes,
+          startTime || performance.now(),
+          false,
+          currentMeta?.fileName,
+          currentMeta?.fileIndex,
+          totalBatchExpectedFiles
+        );
+      }
     };
 
     channel.onerror = (e) => {
@@ -625,7 +809,7 @@ export function startPeerConnection({
         console.log("Channel closed after transfer completed. Disconnect suppressed.");
         return;
       }
-      if (receivedMeta && receivedBytes < receivedMeta.fileSize) {
+      if (currentMeta && overallReceivedBytes < totalBatchExpectedBytes) {
         emit({ type: "status", status: "disconnected", message: "The transfer connection was interrupted." });
         releaseWakeLock();
       }

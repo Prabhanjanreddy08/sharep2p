@@ -6,8 +6,17 @@ import { TransferStatus } from "../components/TransferStatus";
 import { StatusMessage } from "../components/StatusMessage";
 import { ExpiryTimer } from "../components/ExpiryTimer";
 import { formatBytes } from "../components/Formatters";
-import { startPeerConnection, ActiveSession } from "../engine/PeerConnection";
-import { LockKeyhole, MonitorDown, ShieldCheck, Check, X, Radio, ArrowRight, Zap, Globe } from "lucide-react";
+import { startPeerConnection, ActiveSession, ReceivedFile } from "../engine/PeerConnection";
+import { LockKeyhole, MonitorDown, ShieldCheck, Check, X, Radio, ArrowRight, Zap, Globe, Files, Download } from "lucide-react";
+
+interface CompletedItem {
+  blob: Blob;
+  fileName: string;
+  fileSize: number;
+  fileType: string;
+  verified: boolean;
+  downloadUrl: string;
+}
 
 export function ReceiveSessionPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -28,36 +37,38 @@ export function ReceiveSessionPage() {
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("connecting");
   const [statusMessage, setStatusMessage] = useState("");
   const [isLocalDirect, setIsLocalDirect] = useState(false);
-  const [downloadTriggered, setDownloadTriggered] = useState(false);
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [completedFile, setCompletedFile] = useState<{
-    blob: Blob;
-    fileName: string;
-    verified: boolean;
-  } | null>(null);
+  const [completedFiles, setCompletedFiles] = useState<CompletedItem[]>([]);
+  const [savedFileNames, setSavedFileNames] = useState<Set<string>>(new Set());
+  const [isSavingAll, setIsSavingAll] = useState(false);
+  const [currentFileMeta, setCurrentFileMeta] = useState<{ name: string; index: number; total: number } | null>(null);
 
-  const completedFileRef = useRef<{
-    blob: Blob;
-    fileName: string;
-    verified: boolean;
-  } | null>(null);
+  const completedFilesRef = useRef<CompletedItem[]>([]);
   const progressRef = useRef(0);
+  const createdUrlsRef = useRef<string[]>([]);
 
-  // Generate a stable download URL when file is ready; revoked only on unmount
+  // Revoke object URLs on component unmount
   useEffect(() => {
-    if (!completedFile) return;
-    try {
-      const url = URL.createObjectURL(completedFile.blob);
-      setDownloadUrl(url);
-      return () => {
+    return () => {
+      for (const url of createdUrlsRef.current) {
         try {
           URL.revokeObjectURL(url);
         } catch {}
-      };
-    } catch (e) {
-      console.error("Error creating download URL:", e);
-    }
-  }, [completedFile]);
+      }
+    };
+  }, []);
+
+  const createDownloadItem = (file: { blob: Blob; fileName: string; fileSize?: number; fileType?: string; verified: boolean }): CompletedItem => {
+    const downloadUrl = URL.createObjectURL(file.blob);
+    createdUrlsRef.current.push(downloadUrl);
+    return {
+      blob: file.blob,
+      fileName: file.fileName,
+      fileSize: file.fileSize ?? file.blob.size,
+      fileType: file.fileType || "application/octet-stream",
+      verified: file.verified,
+      downloadUrl,
+    };
+  };
 
   useEffect(() => {
     if (!session) return;
@@ -70,8 +81,8 @@ export function ReceiveSessionPage() {
           setIsLocalDirect(evt.isLocalDirect);
         }
         if (evt.type === "status") {
-          // If we already finished or have the completed file, NEVER revert back to disconnected or error!
-          if (completedFileRef.current || progressRef.current === 100) {
+          // If we already finished or have completed files, NEVER revert back to disconnected or error!
+          if (completedFilesRef.current.length > 0 || progressRef.current === 100) {
             console.log("Ignoring status change after transfer completion:", evt.status);
             return;
           }
@@ -80,26 +91,49 @@ export function ReceiveSessionPage() {
         } else if (evt.type === "progress") {
           setProgress(evt.progress);
           progressRef.current = evt.progress;
+          if (evt.currentFileName) {
+            setCurrentFileMeta({
+              name: evt.currentFileName,
+              index: (evt.fileIndex ?? 0) + 1,
+              total: evt.totalFiles ?? (session.files?.length || 1),
+            });
+          }
           setStats({
             transferred: evt.transferred,
             total: evt.total,
             speed: evt.speed,
             eta: evt.eta,
           });
+        } else if (evt.type === "file-complete") {
+          const newItem = createDownloadItem(evt.file);
+          setCompletedFiles((prev) => {
+            const exists = prev.some((p) => p.fileName === newItem.fileName && p.fileSize === newItem.fileSize);
+            const updated = exists ? prev : [...prev, newItem];
+            completedFilesRef.current = updated;
+            return updated;
+          });
         } else if (evt.type === "complete") {
-          const fileData = {
-            blob: evt.blob,
-            fileName: evt.fileName,
-            verified: evt.verified,
-          };
-          completedFileRef.current = fileData;
-          setCompletedFile(fileData);
+          let finalItems: CompletedItem[] = [];
+          if (evt.files && evt.files.length > 0) {
+            finalItems = evt.files.map((f) => createDownloadItem(f));
+          } else if (evt.blob && evt.fileName) {
+            finalItems = [
+              createDownloadItem({
+                blob: evt.blob,
+                fileName: evt.fileName,
+                fileType: evt.fileType,
+                verified: evt.verified,
+              }),
+            ];
+          }
+          if (finalItems.length > 0) {
+            completedFilesRef.current = finalItems;
+            setCompletedFiles(finalItems);
+          }
           setStatus("complete");
           setProgress(100);
           progressRef.current = 100;
-          setStatusMessage("Transfer complete! File is ready on this device.");
-
-          // DO NOT automatically download: keep screen stable and let the user tap Save
+          setStatusMessage("Transfer complete! File(s) are ready on this device.");
         }
       },
     });
@@ -137,36 +171,49 @@ export function ReceiveSessionPage() {
     );
   }
 
-  const handleSaveClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
-    if (!completedFile) return;
-    const safeName = completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
+  const handleSaveFile = async (item: CompletedItem) => {
+    const safeName = item.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
 
-    // Desktop Chrome / Edge: showSaveFilePicker streams directly without memory overhead
+    // 1. Desktop Chromium: showSaveFilePicker with explicit writable.write and writable.close
     if (typeof (window as any).showSaveFilePicker === "function") {
-      e.preventDefault();
       try {
         const handle = await (window as any).showSaveFilePicker({
           suggestedName: safeName,
         });
         const writable = await handle.createWritable();
-        if (typeof (completedFile.blob as any).stream === "function") {
-          await (completedFile.blob as any).stream().pipeTo(writable);
-        } else {
-          await writable.write(completedFile.blob);
-          await writable.close();
-        }
-        setDownloadTriggered(true);
+        await writable.write(item.blob);
+        await writable.close();
+        setSavedFileNames((prev) => new Set(prev).add(item.fileName));
         return;
       } catch (err: any) {
-        if (err.name === "AbortError") return; // User cancelled
-        // Fallback to normal anchor click
-        if (downloadUrl) {
-          window.open(downloadUrl, "_self");
-        }
+        if (err.name === "AbortError") return; // User cancelled save dialog
+        console.warn("showSaveFilePicker failed, falling back to anchor download:", err);
       }
     }
-    // Mobile browsers (Android/iOS): Native <a> tag download runs directly from user's screen tap
-    setDownloadTriggered(true);
+
+    // 2. Mobile (Android/iOS) & Standard browser fallback: Anchor tag click
+    try {
+      const a = document.createElement("a");
+      a.href = item.downloadUrl;
+      a.download = safeName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setSavedFileNames((prev) => new Set(prev).add(item.fileName));
+    } catch (e) {
+      console.error("Failed to trigger download anchor:", e);
+    }
+  };
+
+  const handleSaveAllFiles = async () => {
+    if (completedFiles.length === 0 || isSavingAll) return;
+    setIsSavingAll(true);
+    for (let i = 0; i < completedFiles.length; i++) {
+      await handleSaveFile(completedFiles[i]);
+      // Small pause between multiple mobile downloads prevents browser popup blocker
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    setIsSavingAll(false);
   };
 
   const handleFinish = () => {
@@ -174,11 +221,14 @@ export function ReceiveSessionPage() {
     navigate("/");
   };
 
+  const totalFilesExpected = session.files?.length || 1;
+  const isAllComplete = progress === 100 && completedFiles.length > 0;
+
   return (
     <PageContainer
       eyebrow="02 / Receive"
       title={
-        progress === 100 ? (
+        isAllComplete ? (
           <>
             It’s here.
             <br />
@@ -186,15 +236,15 @@ export function ReceiveSessionPage() {
           </>
         ) : (
           <>
-            A file is
+            {totalFilesExpected > 1 ? "Files are" : "A file is"}
             <br />
-            <em>on its way.</em>
+            <em>on the way.</em>
           </>
         )
       }
       description={
-        progress === 100
-          ? "The transfer is complete. Save the file to this device when you’re ready."
+        isAllComplete
+          ? "The transfer is complete. Save the file(s) to this device when you’re ready."
           : "The devices are paired. The transfer starts automatically over the direct link."
       }
     >
@@ -203,14 +253,18 @@ export function ReceiveSessionPage() {
         <div className="sf-rise sf-rise-1 w-full min-w-0 rounded-[1.6rem] border border-border bg-card p-6 sm:p-8">
           <div className="flex w-full min-w-0 items-start gap-4">
             <span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-secondary text-primary">
-              <FileIcon type={session.fileType} size={26} />
+              {session.files && session.files.length > 1 ? (
+                <Files size={26} className="text-accent" />
+              ) : (
+                <FileIcon type={session.fileType} size={26} />
+              )}
             </span>
             <div className="min-w-0 flex-1">
               <p className="break-all text-xl font-bold tracking-[-.03em] text-primary" data-testid="text-receive-file">
                 {session.fileName}
               </p>
               <p className="mt-1 font-mono-ui text-xs text-muted-foreground">
-                {formatBytes(session.fileSize)} / {session.fileType || "file"}
+                {formatBytes(session.fileSize)} / {session.files && session.files.length > 1 ? `${session.files.length} files` : session.fileType || "file"}
               </p>
             </div>
           </div>
@@ -225,10 +279,12 @@ export function ReceiveSessionPage() {
               total={session.fileSize}
               eta={stats.eta}
               label={
-                progress === 100
+                isAllComplete
                   ? "Ready on this device"
                   : status === "transferring"
-                  ? "Receiving directly"
+                  ? currentFileMeta
+                    ? `Receiving (${currentFileMeta.index}/${currentFileMeta.total}): ${currentFileMeta.name}`
+                    : "Receiving directly"
                   : status === "connected"
                   ? "Direct link established"
                   : status === "error"
@@ -254,7 +310,7 @@ export function ReceiveSessionPage() {
             </div>
           </div>
 
-          {statusMessage && (!completedFile || status === "complete") && (
+          {statusMessage && (completedFiles.length === 0 || status === "complete") && (
             <div className="mt-4">
               <StatusMessage tone={status === "error" ? "error" : status === "complete" ? "success" : "quiet"}>
                 <Radio size={14} className="mt-0.5 shrink-0" />
@@ -263,40 +319,85 @@ export function ReceiveSessionPage() {
             </div>
           )}
 
-          {completedFile && (
-            <div className="mt-5 space-y-3">
-              <a
-                href={downloadUrl || "#"}
-                download={completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download"}
-                onClick={handleSaveClick}
-                className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg active:scale-[0.99] cursor-pointer"
-                data-testid="button-save-file"
-              >
-                <MonitorDown size={16} /> Save to this device {downloadTriggered ? "(Download again)" : ""}
-              </a>
-              {downloadTriggered && (
+          {/* Completed Files Download Area */}
+          {completedFiles.length > 0 && (
+            <div className="mt-6 space-y-4">
+              {completedFiles.length > 1 && (
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-primary">
+                    Received {completedFiles.length} of {totalFilesExpected} files
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleSaveAllFiles}
+                    disabled={isSavingAll}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-bold text-accent-foreground shadow-sm transition-transform hover:-translate-y-0.5 disabled:opacity-50"
+                  >
+                    <Download size={13} /> {isSavingAll ? "Saving…" : "Save all files"}
+                  </button>
+                </div>
+              )}
+
+              {/* Individual file cards with direct save button */}
+              <div className="space-y-2.5 max-h-[340px] overflow-y-auto pr-1">
+                {completedFiles.map((item, idx) => {
+                  const isSaved = savedFileNames.has(item.fileName);
+                  return (
+                    <div
+                      key={`${item.fileName}-${idx}`}
+                      className="flex flex-col gap-3 rounded-xl border border-border/80 bg-secondary/50 p-4 transition-colors hover:border-accent/40 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-card text-primary shadow-sm">
+                          <FileIcon type={item.fileType} size={18} />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-bold text-primary" title={item.fileName}>
+                            {item.fileName}
+                          </p>
+                          <div className="mt-0.5 flex items-center gap-2 font-mono-ui text-[11px] text-muted-foreground">
+                            <span>{formatBytes(item.fileSize)}</span>
+                            {item.verified ? (
+                              <span className="inline-flex items-center gap-0.5 text-emerald-400 font-semibold">
+                                <ShieldCheck size={12} /> SHA-256 verified
+                              </span>
+                            ) : (
+                              <span className="text-amber-400">Unverified</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => handleSaveFile(item)}
+                        className={`inline-flex shrink-0 min-h-10 items-center justify-center gap-2 rounded-xl px-4 text-xs font-bold transition-all shadow-sm active:scale-[0.98] ${
+                          isSaved
+                            ? "bg-secondary text-primary border border-border"
+                            : "bg-primary text-background hover:-translate-y-0.5"
+                        }`}
+                        data-testid={`button-save-file-${idx}`}
+                      >
+                        {isSaved ? (
+                          <>
+                            <Check size={14} className="text-emerald-400" /> Saved (Tap to re-save)
+                          </>
+                        ) : (
+                          <>
+                            <MonitorDown size={14} /> Save to device
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {savedFileNames.size > 0 && (
                 <p className="text-center font-mono-ui text-[11px] text-emerald-400">
-                  ✓ Download initiated! Check your browser’s downloads or notification bar.
+                  ✓ File saved! Check your browser’s downloads or notification tray.
                 </p>
               )}
-            </div>
-          )}
-
-          {completedFile?.verified && (
-            <div className="mt-4">
-              <StatusMessage tone="success">
-                <ShieldCheck size={15} className="mt-0.5 shrink-0" />
-                File verified with SHA-256.
-              </StatusMessage>
-            </div>
-          )}
-
-          {completedFile && !completedFile.verified && (
-            <div className="mt-4">
-              <StatusMessage tone="error">
-                <X size={15} className="mt-0.5 shrink-0" />
-                File verification failed. Do not save this copy.
-              </StatusMessage>
             </div>
           )}
         </div>
@@ -342,3 +443,4 @@ export function ReceiveSessionPage() {
     </PageContainer>
   );
 }
+

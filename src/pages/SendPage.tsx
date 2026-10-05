@@ -5,7 +5,7 @@ import { BackButton } from "../components/BackButton";
 import { FileIcon } from "../components/FileIcon";
 import { StatusMessage } from "../components/StatusMessage";
 import { formatBytes } from "../components/Formatters";
-import { cacheActiveFile, cacheLifeDropFiles } from "../engine/fileCache";
+import { cacheActiveFiles } from "../engine/fileCache";
 import { apiUrl } from "../config";
 import { Upload, X, ArrowRight, LockKeyhole, RefreshCw, Plus, Trash2, Files } from "lucide-react";
 
@@ -21,13 +21,10 @@ export function SendPage() {
     if (!newFiles || newFiles.length === 0) return;
     setError("");
     setFiles((prev) => {
-      // Append files, filtering out exact duplicates (same name, size, lastModified)
       const existingKeys = new Set(prev.map((f) => `${f.name}-${f.size}-${f.lastModified}`));
       const filtered = newFiles.filter((f) => !existingKeys.has(`${f.name}-${f.size}-${f.lastModified}`));
       const updated = [...prev, ...filtered];
-      if (updated.length === 1) {
-        cacheActiveFile(updated[0]);
-      }
+      cacheActiveFiles(updated);
       return updated;
     });
   };
@@ -35,11 +32,9 @@ export function SendPage() {
   const handleRemoveFile = (index: number) => {
     setFiles((prev) => {
       const updated = prev.filter((_, i) => i !== index);
-      if (updated.length === 1) {
-        cacheActiveFile(updated[0]);
-      } else if (updated.length === 0) {
-        cacheActiveFile(null);
-        if (inputRef.current) inputRef.current.value = "";
+      cacheActiveFiles(updated.length > 0 ? updated : null);
+      if (updated.length === 0 && inputRef.current) {
+        inputRef.current.value = "";
       }
       return updated;
     });
@@ -47,7 +42,7 @@ export function SendPage() {
 
   const handleClearAll = () => {
     setFiles([]);
-    cacheActiveFile(null);
+    cacheActiveFiles(null);
     if (inputRef.current) inputRef.current.value = "";
   };
 
@@ -59,71 +54,33 @@ export function SendPage() {
     setIsPending(true);
 
     try {
-      if (files.length === 1) {
-        // Single file transfer
-        const file = files[0];
-        cacheActiveFile(file);
-        const res = await fetch(apiUrl("/api/sessions"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            fileName: file.name,
-            fileSize: file.size,
-            fileType: file.type || "application/octet-stream",
-          }),
-        });
+      await cacheActiveFiles(files);
 
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({}));
-          throw new Error(data.error || "Could not open a sharing lane. Try again.");
-        }
+      const filesMeta = files.map((f) => ({
+        fileName: f.name,
+        fileSize: f.size,
+        fileType: f.type || "application/octet-stream",
+      }));
 
-        const session = await res.json();
-        sessionStorage.setItem("sharefast-active-session", JSON.stringify(session));
-        navigate(`/share/${session.sessionId}`);
-      } else {
-        // Multiple files transfer (packaged seamlessly)
-        const lifedropItems = files.map((f, idx) => ({
-          id: `file-${idx}-${Date.now()}`,
-          kind: "file" as const,
-          label: f.name,
-          fileName: f.name,
-          fileSize: f.size,
-          fileType: f.type || "application/octet-stream",
-          fileRef: f,
-        }));
+      const res = await fetch(apiUrl("/api/sessions"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: files.length === 1 ? files[0].name : `${files.length} files package`,
+          fileSize: totalSize,
+          fileType: files.length === 1 ? (files[0].type || "application/octet-stream") : "application/octet-stream",
+          files: filesMeta,
+        }),
+      });
 
-        await cacheLifeDropFiles(
-          lifedropItems.map((item) => ({ id: item.id, file: item.fileRef }))
-        );
-
-        const res = await fetch(apiUrl("/api/lifedrop"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: `${files.length} files package`,
-            burnAfterPickup: false,
-            items: lifedropItems.map((item) => ({
-              id: item.id,
-              kind: item.kind,
-              label: item.label,
-              fileName: item.fileName,
-              fileSize: item.fileSize,
-              fileType: item.fileType,
-            })),
-          }),
-        });
-
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({}));
-          throw new Error(data.error || "Could not create package lane. Try again.");
-        }
-
-        const session = await res.json();
-        sessionStorage.setItem("sharefast-active-session", JSON.stringify(session));
-        sessionStorage.setItem("lifedrop-items", JSON.stringify(lifedropItems));
-        navigate(`/lifedrop/${session.sessionId}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Could not open a sharing lane. Try again.");
       }
+
+      const session = await res.json();
+      sessionStorage.setItem("sharefast-active-session", JSON.stringify(session));
+      navigate(`/share/${session.sessionId}`);
     } catch (err: any) {
       setError(err.message || "Could not open a sharing lane. Try again.");
     } finally {

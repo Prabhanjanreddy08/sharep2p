@@ -120,9 +120,13 @@ export function LifeDropReceivePage() {
           progressRef.current = evt.progress;
           setStats({ transferred: evt.transferred, total: evt.total, speed: evt.speed, eta: evt.eta });
         } else if (evt.type === "complete") {
-          const fileData = { blob: evt.blob, fileName: evt.fileName, verified: evt.verified };
-          completedFileRef.current = fileData;
-          setCompletedFile(fileData);
+          const blob = evt.blob || evt.files?.[0]?.blob;
+          const fileName = evt.fileName || evt.files?.[0]?.fileName || "download";
+          if (blob) {
+            const fileData = { blob, fileName, verified: evt.verified };
+            completedFileRef.current = fileData;
+            setCompletedFile(fileData);
+          }
           setStatus("complete");
           setProgress(100);
           progressRef.current = 100;
@@ -176,12 +180,8 @@ export function LifeDropReceivePage() {
           suggestedName: safeName,
         });
         const writable = await handle.createWritable();
-        if (typeof (completedFile.blob as any).stream === "function") {
-          await (completedFile.blob as any).stream().pipeTo(writable);
-        } else {
-          await writable.write(completedFile.blob);
-          await writable.close();
-        }
+        await writable.write(completedFile.blob);
+        await writable.close();
         setDownloadTriggered(true);
         return;
       } catch (err: any) {

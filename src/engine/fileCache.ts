@@ -2,6 +2,7 @@ const DB_NAME = "sharefast_cache";
 const STORE_NAME = "files";
 
 let memoryFile: File | null = null;
+let memoryFiles: File[] = [];
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -14,42 +15,76 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-export async function cacheActiveFile(file: File | null): Promise<void> {
-  memoryFile = file;
+export async function cacheActiveFiles(files: File[] | null): Promise<void> {
+  memoryFiles = files || [];
+  memoryFile = memoryFiles.length > 0 ? memoryFiles[0] : null;
   try {
     const db = await openDb();
     const tx = db.transaction(STORE_NAME, "readwrite");
-    if (file) {
-      tx.objectStore(STORE_NAME).put(file, "active_file");
+    const store = tx.objectStore(STORE_NAME);
+    if (files && files.length > 0) {
+      store.put(files, "active_files");
+      store.put(files[0], "active_file");
     } else {
-      tx.objectStore(STORE_NAME).delete("active_file");
+      store.delete("active_files");
+      store.delete("active_file");
     }
   } catch (err) {
-    console.warn("Could not cache file in IndexedDB:", err);
+    console.warn("Could not cache files in IndexedDB:", err);
   }
 }
 
-export async function getCachedActiveFile(): Promise<File | null> {
-  if (memoryFile) return memoryFile;
+export async function getCachedActiveFiles(): Promise<File[]> {
+  if (memoryFiles && memoryFiles.length > 0) return memoryFiles;
   try {
     const db = await openDb();
     return new Promise((resolve) => {
       const tx = db.transaction(STORE_NAME, "readonly");
-      const req = tx.objectStore(STORE_NAME).get("active_file");
+      const req = tx.objectStore(STORE_NAME).get("active_files");
       req.onsuccess = () => {
-        const file = (req.result as File) || null;
-        if (file) memoryFile = file;
-        resolve(file);
+        const files = (req.result as File[]) || [];
+        if (files.length > 0) {
+          memoryFiles = files;
+          memoryFile = files[0];
+          resolve(files);
+        } else {
+          // Fallback to active_file
+          const singleReq = tx.objectStore(STORE_NAME).get("active_file");
+          singleReq.onsuccess = () => {
+            const single = (singleReq.result as File) || null;
+            if (single) {
+              memoryFile = single;
+              memoryFiles = [single];
+              resolve([single]);
+            } else {
+              resolve([]);
+            }
+          };
+          singleReq.onerror = () => resolve([]);
+        }
       };
-      req.onerror = () => resolve(null);
+      req.onerror = () => resolve([]);
     });
   } catch {
-    return null;
+    return [];
   }
+}
+
+export async function cacheActiveFile(file: File | null): Promise<void> {
+  return cacheActiveFiles(file ? [file] : null);
+}
+
+export async function getCachedActiveFile(): Promise<File | null> {
+  const files = await getCachedActiveFiles();
+  return files.length > 0 ? files[0] : null;
 }
 
 export function getActiveFileInMemory(): File | null {
   return memoryFile;
+}
+
+export function getActiveFilesInMemory(): File[] {
+  return memoryFiles;
 }
 
 /* ─── LifeDrop file cache ─── */

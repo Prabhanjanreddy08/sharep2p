@@ -7,10 +7,10 @@ import { ExpiryTimer } from "../components/ExpiryTimer";
 import { TransferStatus } from "../components/TransferStatus";
 import { StatusMessage } from "../components/StatusMessage";
 import { formatBytes } from "../components/Formatters";
-import { getCachedActiveFile, cacheActiveFile } from "../engine/fileCache";
+import { getCachedActiveFiles, getCachedActiveFile, cacheActiveFiles, cacheActiveFile } from "../engine/fileCache";
 import { startPeerConnection, ActiveSession } from "../engine/PeerConnection";
 import { apiUrl } from "../config";
-import { QrCode, Copy, Check, LockKeyhole, X, Radio, ArrowRight, Upload, Zap, Wifi, Globe } from "lucide-react";
+import { QrCode, Copy, Check, LockKeyhole, X, Radio, ArrowRight, Upload, Zap, Wifi, Globe, Files } from "lucide-react";
 
 export function SharePage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -26,7 +26,8 @@ export function SharePage() {
     return null;
   });
 
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const [currentFileMeta, setCurrentFileMeta] = useState<{ name: string; index: number; total: number } | null>(null);
   const [copied, setCopied] = useState<"otp" | "link" | "">("");
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("waiting");
   const [statusMessage, setStatusMessage] = useState("");
@@ -38,17 +39,23 @@ export function SharePage() {
   const statusRef = useRef(status);
 
   useEffect(() => {
-    getCachedActiveFile().then((cached) => {
-      if (cached) setFile(cached);
+    getCachedActiveFiles().then((cachedList) => {
+      if (cachedList && cachedList.length > 0) {
+        setFiles(cachedList);
+      } else {
+        getCachedActiveFile().then((single) => {
+          if (single) setFiles([single]);
+        });
+      }
     });
   }, []);
 
   useEffect(() => {
     if (!session) return;
-    if (!file) {
+    if (files.length === 0) {
       setStatus("error");
       statusRef.current = "error";
-      setStatusMessage("The selected file was cleared on page reload. Re-select it below to resume sharing.");
+      setStatusMessage("The selected file(s) were cleared on page reload. Re-select below to resume sharing.");
       return;
     }
 
@@ -59,7 +66,7 @@ export function SharePage() {
     const client = startPeerConnection({
       session,
       role: "sender",
-      file,
+      files,
       onEvent: (evt) => {
         if (evt.isLocalDirect !== undefined) {
           setIsLocalDirect(evt.isLocalDirect);
@@ -76,6 +83,13 @@ export function SharePage() {
         } else if (evt.type === "progress") {
           setProgress(evt.progress);
           progressRef.current = evt.progress;
+          if (evt.currentFileName) {
+            setCurrentFileMeta({
+              name: evt.currentFileName,
+              index: (evt.fileIndex ?? 0) + 1,
+              total: evt.totalFiles ?? files.length,
+            });
+          }
           if (evt.progress === 100) {
             setStatus("complete");
             statusRef.current = "complete";
@@ -91,7 +105,7 @@ export function SharePage() {
     });
 
     return () => client.close();
-  }, [session, file]);
+  }, [session, files]);
 
   const handleCopy = async (text: string, type: "otp" | "link") => {
     try {
@@ -107,6 +121,7 @@ export function SharePage() {
         await fetch(apiUrl(`/api/sessions/${session.sessionId}?token=${encodeURIComponent(session.token)}`), { method: "DELETE" });
       } catch {}
     }
+    cacheActiveFiles(null);
     cacheActiveFile(null);
     sessionStorage.removeItem("sharefast-active-session");
     navigate("/");
@@ -193,23 +208,61 @@ export function SharePage() {
             <div className="flex w-full min-w-0 items-start justify-between gap-4">
               <div className="flex min-w-0 flex-1 items-center gap-3">
                 <span className="grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-secondary text-primary">
-                  <FileIcon type={session.fileType} />
+                  {session.files && session.files.length > 1 ? (
+                    <Files size={22} className="text-accent" />
+                  ) : (
+                    <FileIcon type={session.fileType} />
+                  )}
                 </span>
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-bold text-primary" title={session.fileName} data-testid="text-share-file">
                     {session.fileName}
                   </p>
                   <p className="mt-1 truncate font-mono-ui text-[10px] text-muted-foreground">
-                    {formatBytes(session.fileSize)} / {session.fileType || "file"}
+                    {formatBytes(session.fileSize)} / {session.files && session.files.length > 1 ? `${session.files.length} files package` : session.fileType || "file"}
                   </p>
                 </div>
               </div>
               <ExpiryTimer expiresAt={session.expiresAt} />
             </div>
 
+            {/* If multi-file, show clean scrollable file list */}
+            {session.files && session.files.length > 1 && (
+              <div className="mt-4 max-h-[160px] space-y-1.5 overflow-y-auto pr-1 border-t border-border/60 pt-3">
+                {session.files.map((f, idx) => {
+                  const isCurrent = currentFileMeta && currentFileMeta.name === f.fileName;
+                  const isPast = currentFileMeta && (currentFileMeta.index - 1) > idx;
+                  return (
+                    <div
+                      key={`${f.fileName}-${idx}`}
+                      className={`flex items-center justify-between rounded-lg px-2.5 py-1.5 text-xs transition-colors ${
+                        isCurrent
+                          ? "bg-accent/15 border border-accent/40 font-semibold text-primary"
+                          : isPast
+                          ? "bg-secondary/40 text-muted-foreground"
+                          : "bg-secondary/60 text-foreground"
+                      }`}
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="shrink-0 text-muted-foreground font-mono-ui text-[10px]">
+                          {idx + 1}.
+                        </span>
+                        <span className="truncate">{f.fileName}</span>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2 font-mono-ui text-[10px]">
+                        <span>{formatBytes(f.fileSize)}</span>
+                        {isCurrent && <span className="text-accent font-bold animate-pulse">● sending</span>}
+                        {isPast && <span className="text-emerald-400 font-bold">✓ sent</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             <div className="mt-5 flex items-center gap-2 rounded-xl bg-secondary px-3 py-2.5 text-xs text-muted-foreground">
               <LockKeyhole size={14} className="shrink-0 text-accent" />
-              <span className="truncate">File bytes travel device to device.</span>
+              <span className="truncate">File bytes travel directly device to device.</span>
             </div>
           </div>
 
@@ -225,7 +278,9 @@ export function SharePage() {
               progress === 100
                 ? "Transfer complete"
                 : status === "transferring"
-                ? "Sending directly"
+                ? currentFileMeta
+                  ? `Sending (${currentFileMeta.index}/${currentFileMeta.total}): ${currentFileMeta.name}`
+                  : "Sending directly"
                 : status === "connected"
                 ? "Receiver connected"
                 : status === "error"
@@ -255,17 +310,19 @@ export function SharePage() {
               <Radio size={14} className="mt-0.5 shrink-0" />
               <div className="min-w-0 flex-1">
                 <span className="break-words">{statusMessage}</span>
-                {!file && (
+                {files.length === 0 && (
                   <div className="mt-3">
                     <input
                       ref={fileInputRef}
                       type="file"
+                      multiple
                       className="hidden"
                       onChange={(e) => {
-                        const selected = e.target.files?.[0];
-                        if (selected) {
-                          cacheActiveFile(selected);
-                          setFile(selected);
+                        const selected = e.target.files ? Array.from(e.target.files) : [];
+                        if (selected.length > 0) {
+                          cacheActiveFiles(selected);
+                          cacheActiveFile(selected[0]);
+                          setFiles(selected);
                         }
                       }}
                     />
@@ -274,7 +331,7 @@ export function SharePage() {
                       onClick={() => fileInputRef.current?.click()}
                       className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-bold text-accent-foreground transition-transform hover:-translate-y-0.5"
                     >
-                      <Upload size={13} /> Re-select {session?.fileName || "file"}
+                      <Upload size={13} /> Re-select {session?.fileName || "file(s)"}
                     </button>
                   </div>
                 )}
