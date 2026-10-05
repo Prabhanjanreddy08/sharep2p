@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { PageContainer } from "../components/PageHeader";
 import { FileIcon } from "../components/FileIcon";
@@ -28,11 +28,41 @@ export function ReceiveSessionPage() {
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("connecting");
   const [statusMessage, setStatusMessage] = useState("");
   const [isLocalDirect, setIsLocalDirect] = useState(false);
+  const [downloadTriggered, setDownloadTriggered] = useState(false);
   const [completedFile, setCompletedFile] = useState<{
     blob: Blob;
     fileName: string;
     verified: boolean;
   } | null>(null);
+
+  const completedFileRef = useRef<{
+    blob: Blob;
+    fileName: string;
+    verified: boolean;
+  } | null>(null);
+  const progressRef = useRef(0);
+
+  const triggerDownload = (blob: Blob, fileName: string) => {
+    try {
+      const safeName = fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = url;
+      a.download = safeName;
+      document.body.appendChild(a);
+      a.click();
+      setDownloadTriggered(true);
+      setTimeout(() => {
+        try {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        } catch {}
+      }, 120_000);
+    } catch (e) {
+      console.error("Download trigger error:", e);
+    }
+  };
 
   useEffect(() => {
     if (!session) return;
@@ -45,10 +75,16 @@ export function ReceiveSessionPage() {
           setIsLocalDirect(evt.isLocalDirect);
         }
         if (evt.type === "status") {
+          // If we already finished or have the completed file, NEVER revert back to disconnected or error!
+          if (completedFileRef.current || progressRef.current === 100) {
+            console.log("Ignoring status change after transfer completion:", evt.status);
+            return;
+          }
           setStatus(evt.status);
           if (evt.message) setStatusMessage(evt.message);
         } else if (evt.type === "progress") {
           setProgress(evt.progress);
+          progressRef.current = evt.progress;
           setStats({
             transferred: evt.transferred,
             total: evt.total,
@@ -56,11 +92,20 @@ export function ReceiveSessionPage() {
             eta: evt.eta,
           });
         } else if (evt.type === "complete") {
-          setCompletedFile({
+          const fileData = {
             blob: evt.blob,
             fileName: evt.fileName,
             verified: evt.verified,
-          });
+          };
+          completedFileRef.current = fileData;
+          setCompletedFile(fileData);
+          setStatus("complete");
+          setProgress(100);
+          progressRef.current = 100;
+          setStatusMessage("Transfer complete! File is ready on this device.");
+
+          // Automatically trigger download directly to device
+          triggerDownload(fileData.blob, fileData.fileName);
         }
       },
     });
@@ -100,17 +145,7 @@ export function ReceiveSessionPage() {
 
   const handleSave = () => {
     if (!completedFile) return;
-    const safeName = completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
-    const url = URL.createObjectURL(completedFile.blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = safeName;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }, 60000);
+    triggerDownload(completedFile.blob, completedFile.fileName);
   };
 
   const handleFinish = () => {
@@ -198,9 +233,9 @@ export function ReceiveSessionPage() {
             </div>
           </div>
 
-          {statusMessage && (
+          {statusMessage && (!completedFile || status === "complete") && (
             <div className="mt-4">
-              <StatusMessage tone={status === "error" || status === "disconnected" ? "error" : "quiet"}>
+              <StatusMessage tone={status === "error" ? "error" : status === "complete" ? "success" : "quiet"}>
                 <Radio size={14} className="mt-0.5 shrink-0" />
                 <span className="break-words">{statusMessage}</span>
               </StatusMessage>
@@ -208,14 +243,21 @@ export function ReceiveSessionPage() {
           )}
 
           {completedFile && (
-            <button
-              type="button"
-              onClick={handleSave}
-              className="mt-5 flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background"
-              data-testid="button-save-file"
-            >
-              <MonitorDown size={16} /> Save to this device
-            </button>
+            <div className="mt-5 space-y-3">
+              <button
+                type="button"
+                onClick={handleSave}
+                className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg"
+                data-testid="button-save-file"
+              >
+                <MonitorDown size={16} /> Save to this device {downloadTriggered ? "(Download again)" : ""}
+              </button>
+              {downloadTriggered && (
+                <p className="text-center font-mono-ui text-[11px] text-emerald-400">
+                  ✓ Download started automatically in your browser!
+                </p>
+              )}
+            </div>
           )}
 
           {completedFile?.verified && (

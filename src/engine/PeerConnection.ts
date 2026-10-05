@@ -235,24 +235,20 @@ class StreamSink {
       this.pendingBytes += u8.byteLength;
       if (this.pendingBytes >= this.FLUSH_LIMIT) {
         const toWrite = this.pendingBuffer;
-        const totalLen = this.pendingBytes;
         const chunkIdx = this.idbChunkIndex++;
         this.pendingBuffer = [];
         this.pendingBytes = 0;
 
+        // Store as disk-backed Blob in IndexedDB: Prevents memory exhaustion for 5GB+ files
+        const blobPart = new Blob(toWrite, { type: "application/octet-stream" });
+
         this.writeQueue = this.writeQueue
           .then(() => {
-            const merged = new Uint8Array(totalLen);
-            let pos = 0;
-            for (const b of toWrite) {
-              merged.set(b, pos);
-              pos += b.byteLength;
-            }
             return new Promise<void>((resolve, reject) => {
               if (!this.idbDb) return resolve();
               const tx = this.idbDb.transaction("chunks", "readwrite");
               const store = tx.objectStore("chunks");
-              const req = store.put(merged, chunkIdx);
+              const req = store.put(blobPart, chunkIdx);
               req.onsuccess = () => resolve();
               req.onerror = () => reject(req.error);
             });
@@ -286,29 +282,28 @@ class StreamSink {
           .catch((err) => console.error("OPFS final write error:", err));
       }
       await this.writeQueue;
-      await this.opfsWritable.close();
+      try {
+        await this.opfsWritable.close();
+      } catch (err) {
+        console.warn("OPFS close error:", err);
+      }
       const file = await this.opfsFileHandle.getFile();
       return file;
     } else if (this.useIdb && this.idbDb) {
       if (this.pendingBytes > 0) {
         const toWrite = this.pendingBuffer;
-        const totalLen = this.pendingBytes;
         const chunkIdx = this.idbChunkIndex++;
         this.pendingBuffer = [];
         this.pendingBytes = 0;
+        const blobPart = new Blob(toWrite, { type: "application/octet-stream" });
+
         this.writeQueue = this.writeQueue
           .then(() => {
-            const merged = new Uint8Array(totalLen);
-            let pos = 0;
-            for (const b of toWrite) {
-              merged.set(b, pos);
-              pos += b.byteLength;
-            }
             return new Promise<void>((resolve, reject) => {
               if (!this.idbDb) return resolve();
               const tx = this.idbDb.transaction("chunks", "readwrite");
               const store = tx.objectStore("chunks");
-              const req = store.put(merged, chunkIdx);
+              const req = store.put(blobPart, chunkIdx);
               req.onsuccess = () => resolve();
               req.onerror = () => reject(req.error);
             });
@@ -317,7 +312,7 @@ class StreamSink {
       }
       await this.writeQueue;
 
-      // Read back all chunks from IndexedDB into a unified Blob without loading into active JS heap
+      // Read back all Blob handles from IndexedDB into a master Blob without loading bytes into active RAM
       return new Promise<Blob>((resolve, reject) => {
         if (!this.idbDb) return resolve(new Blob([], { type: fileType }));
         const tx = this.idbDb.transaction("chunks", "readonly");
@@ -363,6 +358,7 @@ export function startPeerConnection({
 }) {
   let isClosed = false;
   let isDirectLocal = false;
+  let isTransferComplete = false;
   let dataChannelRef: RTCDataChannel | null = null;
 
   // Keep mobile device screen awake during transfer
@@ -528,14 +524,32 @@ export function startPeerConnection({
       updateProgress(file.size, file.size, sendStart, true);
 
       if (offset >= file.size) {
-        channel.send(JSON.stringify({ kind: "file-complete" }));
+        // Wait until all remaining chunks drain from the local network buffer
+        while (channel.bufferedAmount > 0 && channel.readyState === "open") {
+          await waitBufferedAmountLow(channel, 0);
+        }
+        if (channel.readyState === "open") {
+          channel.send(JSON.stringify({ kind: "file-complete" }));
+        }
+        isTransferComplete = true;
         emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
         releaseWakeLock();
       }
     };
 
     channel.onmessage = async (evt) => {
-      if (role === "sender") return;
+      if (role === "sender") {
+        if (typeof evt.data === "string") {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.kind === "file-ack") {
+              isTransferComplete = true;
+              emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
+            }
+          } catch {}
+        }
+        return;
+      }
 
       if (typeof evt.data === "string") {
         try {
@@ -554,6 +568,8 @@ export function startPeerConnection({
             const blob = await receiverSink.finish(receivedMeta.fileType);
             const computedSha = await computeSha256(blob);
             const verified = blob.size === receivedMeta.fileSize && computedSha === receivedMeta.sha256;
+
+            isTransferComplete = true; // Protect against disconnect events
 
             emit({
               type: "progress",
@@ -575,6 +591,13 @@ export function startPeerConnection({
             });
             emit({ type: "status", status: "complete", isLocalDirect: isDirectLocal });
             releaseWakeLock();
+
+            // Send acknowledgment to sender
+            try {
+              if (channel.readyState === "open") {
+                channel.send(JSON.stringify({ kind: "file-ack" }));
+              }
+            } catch {}
           }
         } catch (e) {
           console.error("Data channel parse error:", e);
@@ -591,11 +614,17 @@ export function startPeerConnection({
 
     channel.onerror = (e) => {
       console.error("DataChannel error:", e);
-      emit({ type: "status", status: "error", message: "Data channel error occurred." });
+      if (!isTransferComplete) {
+        emit({ type: "status", status: "error", message: "Data channel error occurred." });
+      }
       releaseWakeLock();
     };
 
     channel.onclose = () => {
+      if (isTransferComplete) {
+        console.log("Channel closed after transfer completed. Disconnect suppressed.");
+        return;
+      }
       if (receivedMeta && receivedBytes < receivedMeta.fileSize) {
         emit({ type: "status", status: "disconnected", message: "The transfer connection was interrupted." });
         releaseWakeLock();
@@ -610,13 +639,17 @@ export function startPeerConnection({
   };
 
   pc.onconnectionstatechange = () => {
+    if (isTransferComplete) {
+      console.log("Peer connection state changed after transfer completed. Disconnect suppressed.");
+      return;
+    }
     if (pc.connectionState === "failed") {
       emit({ type: "status", status: "error", message: "Direct P2P connection failed. Check network and try again." });
       releaseWakeLock();
     } else if (pc.connectionState === "disconnected") {
       // Allow WebRTC ICE agent to attempt reconnection before declaring failure
       setTimeout(() => {
-        if (pc.connectionState === "disconnected" && !isClosed) {
+        if (pc.connectionState === "disconnected" && !isClosed && !isTransferComplete) {
           emit({ type: "status", status: "disconnected", message: "The other device disconnected." });
           releaseWakeLock();
         }
@@ -645,9 +678,9 @@ export function startPeerConnection({
         return;
       }
       if (msg.type === "peer-disconnected") {
-        // DO NOT kill active transfer if WebRTC direct channel is already streaming!
-        if (dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
-          console.log("Signaling reported peer WS closed, but WebRTC direct channel is active.");
+        // DO NOT kill completed transfer or actively streaming channel
+        if (isTransferComplete || dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
+          console.log("Signaling reported peer WS closed, but transfer is complete or active.");
           return;
         }
         emit({ type: "status", status: "disconnected", message: "The other device disconnected." });

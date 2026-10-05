@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { PageContainer } from "../components/PageHeader";
 import { TransferStatus } from "../components/TransferStatus";
@@ -60,8 +60,34 @@ export function LifeDropReceivePage() {
   const [stats, setStats] = useState({ transferred: 0, total: 0, speed: 0, eta: 0 });
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("connecting");
   const [statusMessage, setStatusMessage] = useState("");
+  const [downloadTriggered, setDownloadTriggered] = useState(false);
   const [completedFile, setCompletedFile] = useState<{ blob: Blob; fileName: string; verified: boolean } | null>(null);
   const [copiedId, setCopiedId] = useState("");
+
+  const completedFileRef = useRef<{ blob: Blob; fileName: string; verified: boolean } | null>(null);
+  const progressRef = useRef(0);
+
+  const triggerDownload = (blob: Blob, fileName: string) => {
+    try {
+      const safeName = fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.style.display = "none";
+      a.href = url;
+      a.download = safeName;
+      document.body.appendChild(a);
+      a.click();
+      setDownloadTriggered(true);
+      setTimeout(() => {
+        try {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        } catch {}
+      }, 120_000);
+    } catch (e) {
+      console.error("LifeDrop download error:", e);
+    }
+  };
 
   const fileItems = (session?.lifedrop?.items || []).filter((i) => i.kind === "file" || i.kind === "photo");
   const textItems = (session?.lifedrop?.items || []).filter((i) => i.kind !== "file" && i.kind !== "photo");
@@ -87,13 +113,28 @@ export function LifeDropReceivePage() {
       role: "receiver",
       onEvent: (evt) => {
         if (evt.type === "status") {
+          // If transfer already completed, do not revert to disconnected or error
+          if (completedFileRef.current || progressRef.current === 100) {
+            console.log("LifeDrop ignoring status change after transfer completion:", evt.status);
+            return;
+          }
           setStatus(evt.status);
           if (evt.message) setStatusMessage(evt.message);
         } else if (evt.type === "progress") {
           setProgress(evt.progress);
+          progressRef.current = evt.progress;
           setStats({ transferred: evt.transferred, total: evt.total, speed: evt.speed, eta: evt.eta });
         } else if (evt.type === "complete") {
-          setCompletedFile({ blob: evt.blob, fileName: evt.fileName, verified: evt.verified });
+          const fileData = { blob: evt.blob, fileName: evt.fileName, verified: evt.verified };
+          completedFileRef.current = fileData;
+          setCompletedFile(fileData);
+          setStatus("complete");
+          setProgress(100);
+          progressRef.current = 100;
+          setStatusMessage("Transfer complete! File is ready on this device.");
+
+          // Automatically trigger download directly to device
+          triggerDownload(fileData.blob, fileData.fileName);
         }
       },
     });
@@ -132,13 +173,7 @@ export function LifeDropReceivePage() {
 
   const handleSaveFile = () => {
     if (!completedFile) return;
-    const safeName = completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
-    const url = URL.createObjectURL(completedFile.blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = safeName;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    triggerDownload(completedFile.blob, completedFile.fileName);
   };
 
   const handleCopyText = async (text: string, itemId: string) => {
@@ -282,13 +317,20 @@ export function LifeDropReceivePage() {
               />
 
               {completedFile && (
-                <button
-                  type="button"
-                  onClick={handleSaveFile}
-                  className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background"
-                >
-                  <Download size={16} /> Save file to this device
-                </button>
+                <div className="mt-5 space-y-3">
+                  <button
+                    type="button"
+                    onClick={handleSaveFile}
+                    className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg"
+                  >
+                    <Download size={16} /> Save file to this device {downloadTriggered ? "(Download again)" : ""}
+                  </button>
+                  {downloadTriggered && (
+                    <p className="text-center font-mono-ui text-[11px] text-emerald-400">
+                      ✓ Download started automatically in your browser!
+                    </p>
+                  )}
+                </div>
               )}
 
               {completedFile?.verified && (
@@ -300,8 +342,8 @@ export function LifeDropReceivePage() {
             </div>
           )}
 
-          {statusMessage && (
-            <StatusMessage tone={status === "error" || status === "disconnected" ? "error" : "quiet"}>
+          {statusMessage && (!completedFile || status === "complete") && (
+            <StatusMessage tone={status === "error" ? "error" : status === "complete" ? "success" : "quiet"}>
               <Radio size={14} className="mt-0.5 shrink-0" />
               {statusMessage}
             </StatusMessage>
