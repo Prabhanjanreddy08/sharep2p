@@ -20,14 +20,14 @@ export function QrCodeDisplay({ value, small = false }: { value: string; small?:
 
   return (
     <div
-      className={`relative aspect-square w-full rounded-lg bg-[#faf8f5] p-3 ${
+      className={`mx-auto relative aspect-square w-full rounded-2xl bg-[#faf8f5] p-3 shadow-inner flex items-center justify-center ${
         small ? "max-w-[164px]" : "max-w-[250px]"
       }`}
       aria-label="QR pairing code"
       data-testid="display-qr-code"
     >
-      <canvas ref={canvasRef} className="h-full w-full rounded-md" />
-      <span className="pointer-events-none absolute inset-0 rounded-lg ring-1 ring-inset ring-accent/25" />
+      <canvas ref={canvasRef} className="h-full w-full rounded-xl" />
+      <span className="pointer-events-none absolute inset-0 rounded-2xl ring-1 ring-inset ring-accent/25" />
     </div>
   );
 }

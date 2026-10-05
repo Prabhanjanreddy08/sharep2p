@@ -78,6 +78,115 @@ function releaseWakeLock() {
   }
 }
 
+/* ─── Background Keep-Alive Audio (Prevents Mobile OS from Freezing Tab on App Switch) ─── */
+let cachedSilentAudioUrl: string | null = null;
+function getSilentAudioUrl(): string {
+  if (cachedSilentAudioUrl) return cachedSilentAudioUrl;
+  if (typeof Blob === "undefined" || typeof URL === "undefined") {
+    return "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+  }
+  const sampleRate = 8000;
+  const numSamples = sampleRate * 2; // 2 seconds of silence
+  const buffer = new ArrayBuffer(44 + numSamples);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + numSamples, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // Mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  writeString(36, "data");
+  view.setUint32(40, numSamples, true);
+  new Uint8Array(buffer, 44).fill(128); // 128 is silence for 8-bit PCM
+
+  const blob = new Blob([buffer], { type: "audio/wav" });
+  cachedSilentAudioUrl = URL.createObjectURL(blob);
+  return cachedSilentAudioUrl;
+}
+
+class BackgroundKeepAlive {
+  private audio: HTMLAudioElement | null = null;
+  private ctx: any = null;
+  private osc: any = null;
+  private active = false;
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+
+    // 1. Silent HTML5 audio element playing 2-second WAV on continuous loop
+    try {
+      if (!this.audio) {
+        const a = new Audio(getSilentAudioUrl());
+        a.loop = true;
+        a.volume = 0.01;
+        (a as any).playsInline = true;
+        (a as any).webkitPlaysInline = true;
+        this.audio = a;
+      }
+      const playPromise = this.audio.play();
+      if (playPromise && typeof playPromise.catch === "function") {
+        playPromise.catch(() => {});
+      }
+    } catch {}
+
+    // 2. Web Audio sub-audible oscillator: keeps the audio thread alive in the OS background audio session
+    try {
+      const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (AC && !this.ctx) {
+        const c = new AC();
+        const g = c.createGain();
+        g.gain.value = 0.00001;
+        const o = c.createOscillator();
+        o.frequency.value = 20; // 20Hz sub-audible
+        o.connect(g);
+        g.connect(c.destination);
+        o.start();
+        if (c.state === "suspended") {
+          c.resume().catch(() => {});
+        }
+        this.ctx = c;
+        this.osc = o;
+      } else if (this.ctx && this.ctx.state === "suspended") {
+        this.ctx.resume().catch(() => {});
+      }
+    } catch {}
+  }
+
+  stop() {
+    this.active = false;
+    if (this.audio) {
+      try {
+        this.audio.pause();
+      } catch {}
+    }
+    if (this.ctx && this.ctx.state === "running") {
+      try {
+        this.ctx.suspend().catch(() => {});
+      } catch {}
+    }
+  }
+}
+const backgroundKeepAlive = new BackgroundKeepAlive();
+
+// Ensure audio context and wake lock permissions are unlocked upon the first user interaction
+if (typeof window !== "undefined") {
+  const unlockBackgroundPrivileges = () => {
+    backgroundKeepAlive.start();
+    requestWakeLock();
+  };
+  window.addEventListener("click", unlockBackgroundPrivileges, { passive: true });
+  window.addEventListener("touchstart", unlockBackgroundPrivileges, { passive: true });
+}
+
 /* ─── High-Throughput Gigabit WebRTC Pipeline (100MB/s - 1GB/s line rate) ─── */
 const CHUNK_SIZE = 64 * 1024; // 64KB per SCTP chunk
 const BLOCK_SIZE = 16 * 1024 * 1024; // 16MB block slices from File
@@ -389,8 +498,9 @@ export function startPeerConnection({
   let isTransferComplete = false;
   let dataChannelRef: RTCDataChannel | null = null;
 
-  // Keep mobile device screen awake during transfer
+  // Keep mobile device screen awake and runtime active during transfer even when switching apps
   requestWakeLock();
+  backgroundKeepAlive.start();
 
   const filesToSend: File[] = [];
   if (files && files.length > 0) {
@@ -403,7 +513,8 @@ export function startPeerConnection({
       ? filesToSend.reduce((acc, f) => acc + f.size, 0)
       : session.fileSize;
 
-  const ws = new WebSocket(getWebSocketUrl(session, role));
+  let ws: WebSocket | null = null;
+  let wsReconnectTimer: any = null;
 
   // Configure STUN + Global OpenRelay TURN servers (with TCP fallback) so transfers work on low cellular signal, behind symmetric NATs, or Wi-Fi
   const pc = new RTCPeerConnection({
@@ -469,15 +580,18 @@ export function startPeerConnection({
     if (!isClosed) onEvent(event);
   };
 
+  const pendingSignalingQueue: any[] = [];
   const sendSignaling = (msg: any) => {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
+    } else {
+      pendingSignalingQueue.push(msg);
     }
   };
 
   // Heartbeat ping every 15s to keep Render / mobile proxies open
   const heartbeatTimer = setInterval(() => {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "ping" }));
     }
   }, 15_000);
@@ -822,22 +936,45 @@ export function startPeerConnection({
     }
   };
 
+  let iceDisconnectTimer: any = null;
   pc.onconnectionstatechange = () => {
     if (isTransferComplete) {
       console.log("Peer connection state changed after transfer completed. Disconnect suppressed.");
       return;
     }
-    if (pc.connectionState === "failed") {
-      emit({ type: "status", status: "error", message: "Direct P2P connection failed. Check network and try again." });
-      releaseWakeLock();
+    if (pc.connectionState === "connected") {
+      if (iceDisconnectTimer) {
+        clearTimeout(iceDisconnectTimer);
+        iceDisconnectTimer = null;
+      }
+      emit({
+        type: "status",
+        status: dataChannelRef?.readyState === "open" ? "transferring" : "connected",
+        isLocalDirect: isDirectLocal,
+      });
     } else if (pc.connectionState === "disconnected") {
-      // Allow WebRTC ICE agent to attempt reconnection before declaring failure
+      // Mobile app switching temporarily sets ICE to disconnected. Give 35s to restore.
+      if (!iceDisconnectTimer) {
+        iceDisconnectTimer = setTimeout(() => {
+          iceDisconnectTimer = null;
+          if (pc.connectionState === "disconnected" && !isClosed && !isTransferComplete) {
+            emit({ type: "status", status: "disconnected", message: "The other device disconnected." });
+            releaseWakeLock();
+            backgroundKeepAlive.stop();
+          }
+        }, 35_000);
+      }
+    } else if (pc.connectionState === "failed") {
+      try {
+        pc.restartIce();
+      } catch {}
       setTimeout(() => {
-        if (pc.connectionState === "disconnected" && !isClosed && !isTransferComplete) {
-          emit({ type: "status", status: "disconnected", message: "The other device disconnected." });
+        if (pc.connectionState === "failed" && !isClosed && !isTransferComplete) {
+          emit({ type: "status", status: "error", message: "Direct P2P connection failed. Check network and try again." });
           releaseWakeLock();
+          backgroundKeepAlive.stop();
         }
-      }, 5000);
+      }, 10_000);
     }
   };
 
@@ -847,94 +984,162 @@ export function startPeerConnection({
     pc.ondatachannel = (event) => setupDataChannel(event.channel);
   }
 
-  ws.onopen = () => {
-    emit({ type: "status", status: "waiting" });
-  };
+  // Auto-reconnecting signaling client (keeps connection alive across mobile app switches)
+  const connectWs = () => {
+    if (isClosed || isTransferComplete) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
-  ws.onmessage = async (evt) => {
     try {
-      const msg = JSON.parse(evt.data);
-      if (msg.type === "pong") {
-        return; // Heartbeat acknowledged
+      ws = new WebSocket(getWebSocketUrl(session, role));
+    } catch {
+      scheduleWsReconnect();
+      return;
+    }
+
+    ws.onopen = () => {
+      if (wsReconnectTimer) {
+        clearTimeout(wsReconnectTimer);
+        wsReconnectTimer = null;
       }
-      if (msg.type === "error") {
-        emit({ type: "status", status: "error", message: msg.message });
-        return;
+      while (pendingSignalingQueue.length > 0 && ws && ws.readyState === WebSocket.OPEN) {
+        const queued = pendingSignalingQueue.shift();
+        ws.send(JSON.stringify(queued));
       }
-      if (msg.type === "peer-disconnected") {
-        // DO NOT kill completed transfer or actively streaming channel
-        if (isTransferComplete || dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
-          console.log("Signaling reported peer WS closed, but transfer is complete or active.");
+      if (!dataChannelRef || dataChannelRef.readyState !== "open") {
+        emit({ type: "status", status: "waiting" });
+      }
+    };
+
+    ws.onmessage = async (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === "pong") {
+          return; // Heartbeat acknowledged
+        }
+        if (msg.type === "error") {
+          emit({ type: "status", status: "error", message: msg.message });
           return;
         }
-        emit({ type: "status", status: "disconnected", message: "The other device disconnected." });
-        return;
-      }
-      if (msg.type === "peer-connected" && role === "sender" && pc.signalingState === "stable") {
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        sendSignaling({ type: "offer", payload: offer });
-        return;
-      }
-      if (msg.type === "offer" && role === "receiver") {
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
-        remoteDescSet = true;
-        for (const candidate of pendingIceCandidates) {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        if (msg.type === "peer-disconnected") {
+          // DO NOT kill completed transfer or actively streaming channel
+          if (isTransferComplete || dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
+            console.log("Signaling reported peer WS closed, but transfer is active/complete.");
+            return;
+          }
+          emit({ type: "status", status: "disconnected", message: "The other device disconnected." });
+          return;
         }
-        pendingIceCandidates = [];
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sendSignaling({ type: "answer", payload: answer });
+        if (msg.type === "peer-connected" && role === "sender" && pc.signalingState === "stable") {
+          // If WebRTC data channel is already open and active, do not re-create offer and disrupt transfer
+          if (dataChannelRef && dataChannelRef.readyState === "open") {
+            console.log("Signaling reconnected, but WebRTC data channel is already active.");
+            return;
+          }
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendSignaling({ type: "offer", payload: offer });
+          return;
+        }
+        if (msg.type === "offer" && role === "receiver") {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+          remoteDescSet = true;
+          for (const candidate of pendingIceCandidates) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          pendingIceCandidates = [];
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendSignaling({ type: "answer", payload: answer });
+          return;
+        }
+        if (msg.type === "answer" && role === "sender") {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+          remoteDescSet = true;
+          for (const candidate of pendingIceCandidates) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          pendingIceCandidates = [];
+          return;
+        }
+        if (msg.type === "ice-candidate") {
+          const candidate = msg.payload;
+          if (remoteDescSet) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          } else {
+            pendingIceCandidates.push(candidate);
+          }
+        }
+      } catch (e) {
+        console.error("Signaling message error:", e);
+      }
+    };
+
+    ws.onerror = () => {
+      // If WebRTC is already transferring, do not show error
+      if (dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
         return;
       }
-      if (msg.type === "answer" && role === "sender") {
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
-        remoteDescSet = true;
-        for (const candidate of pendingIceCandidates) {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        }
-        pendingIceCandidates = [];
-        return;
-      }
-      if (msg.type === "ice-candidate") {
-        const candidate = msg.payload;
-        if (remoteDescSet) {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } else {
-          pendingIceCandidates.push(candidate);
-        }
-      }
-    } catch (e) {
-      console.error("Signaling message error:", e);
+    };
+
+    ws.onclose = () => {
+      scheduleWsReconnect();
+    };
+  };
+
+  const scheduleWsReconnect = () => {
+    if (isClosed || isTransferComplete) return;
+    if (!wsReconnectTimer) {
+      wsReconnectTimer = setTimeout(() => {
+        wsReconnectTimer = null;
+        connectWs();
+      }, 1500);
     }
   };
 
-  ws.onerror = () => {
-    // If WebRTC is already transferring, do not show error
-    if (dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
-      return;
-    }
-    emit({ type: "status", status: "error", message: "Signaling is unavailable. Check the connection and try again." });
-  };
+  connectWs();
 
-  ws.onclose = () => {
-    clearInterval(heartbeatTimer);
-    // DO NOT abort if WebRTC direct channel is actively transferring or connected!
-    if (dataChannelRef?.readyState === "open" || pc.connectionState === "connected") {
-      console.log("Signaling WebSocket closed, but direct WebRTC DataChannel is actively streaming.");
-      return;
-    }
-    emit({ type: "status", status: "disconnected", message: "The pairing session closed." });
-  };
+  // Visibility change listener: When user switches back from another app, restore WakeLock, audio keepalive & connection
+  let onVisibilityChange: (() => void) | null = null;
+  if (typeof document !== "undefined") {
+    onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        requestWakeLock();
+        backgroundKeepAlive.start();
+        if (!isClosed && !isTransferComplete) {
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            connectWs();
+          }
+          // If ICE or connection state became disconnected during app switch, attempt ICE recovery
+          if (pc.connectionState === "disconnected" || pc.iceConnectionState === "disconnected") {
+            if (role === "sender") {
+              try {
+                pc.restartIce();
+                pc.createOffer({ iceRestart: true })
+                  .then((offer) => pc.setLocalDescription(offer))
+                  .then(() => sendSignaling({ type: "offer", payload: pc.localDescription }))
+                  .catch(() => {});
+              } catch {}
+            }
+          }
+        }
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+  }
 
   return {
     close() {
       isClosed = true;
       releaseWakeLock();
+      backgroundKeepAlive.stop();
+      if (onVisibilityChange && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      if (iceDisconnectTimer) clearTimeout(iceDisconnectTimer);
       clearInterval(heartbeatTimer);
       try {
-        ws.close();
+        ws?.close();
       } catch {}
       try {
         pc.close();
@@ -944,9 +1149,15 @@ export function startPeerConnection({
       sendSignaling({ type: "cancel" });
       isClosed = true;
       releaseWakeLock();
+      backgroundKeepAlive.stop();
+      if (onVisibilityChange && typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
+      if (iceDisconnectTimer) clearTimeout(iceDisconnectTimer);
       clearInterval(heartbeatTimer);
       try {
-        ws.close();
+        ws?.close();
       } catch {}
       try {
         pc.close();

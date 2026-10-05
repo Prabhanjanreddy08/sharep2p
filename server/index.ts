@@ -44,6 +44,7 @@ interface Session {
   createdAt: number;
   senderWs: WebSocket | null;
   receiverWs: WebSocket | null;
+  disconnectTimer?: any;
   /** LifeDrop: if set, this is a multi-item session */
   lifedrop?: {
     title: string;
@@ -99,6 +100,10 @@ function throttle(ip: string): boolean {
 function destroySession(id: string) {
   const s = sessions.get(id);
   if (!s) return;
+  if (s.disconnectTimer) {
+    clearTimeout(s.disconnectTimer);
+    s.disconnectTimer = null;
+  }
   tokenToSession.delete(s.token);
   otpToSession.delete(s.otp);
   sessions.delete(id);
@@ -387,6 +392,12 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
+  // Clear any pending disconnect timer if peer is reconnecting
+  if (session.disconnectTimer) {
+    clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = null;
+  }
+
   if (role === "sender") {
     if (session.senderWs && session.senderWs !== ws && session.senderWs.readyState === WebSocket.OPEN) {
       session.senderWs.close();
@@ -399,7 +410,7 @@ wss.on("connection", (ws, req) => {
     session.receiverWs = ws;
   }
 
-  // When receiver connects, notify sender that peer is connected
+  // When both peers are connected (or reconnected), notify both sides
   if (
     session.senderWs &&
     session.senderWs.readyState === WebSocket.OPEN &&
@@ -407,6 +418,7 @@ wss.on("connection", (ws, req) => {
     session.receiverWs.readyState === WebSocket.OPEN
   ) {
     session.senderWs.send(JSON.stringify({ type: "peer-connected" }));
+    session.receiverWs.send(JSON.stringify({ type: "peer-connected" }));
   }
 
   // Keep connection alive through proxies (Render, mobile NATs) with 20s ping
@@ -443,13 +455,26 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     clearInterval(keepAliveTimer);
-    const peer = role === "sender" ? session.receiverWs : session.senderWs;
-    if (role === "sender") session.senderWs = null;
-    else session.receiverWs = null;
-
-    if (peer && peer.readyState === WebSocket.OPEN) {
-      peer.send(JSON.stringify({ type: "peer-disconnected", role }));
+    if (role === "sender") {
+      if (session.senderWs === ws) session.senderWs = null;
+    } else {
+      if (session.receiverWs === ws) session.receiverWs = null;
     }
+
+    // Give 35s grace period so app-switching on mobile doesn't instantly sever the transfer!
+    if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = setTimeout(() => {
+      session.disconnectTimer = null;
+      const isSenderMissing = !session.senderWs || session.senderWs.readyState !== WebSocket.OPEN;
+      const isReceiverMissing = !session.receiverWs || session.receiverWs.readyState !== WebSocket.OPEN;
+
+      if (isSenderMissing || isReceiverMissing) {
+        const peer = role === "sender" ? session.receiverWs : session.senderWs;
+        if (peer && peer.readyState === WebSocket.OPEN) {
+          peer.send(JSON.stringify({ type: "peer-disconnected", role }));
+        }
+      }
+    }, 35_000);
   });
 
   ws.on("error", (err) => {

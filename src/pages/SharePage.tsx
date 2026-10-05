@@ -170,39 +170,40 @@ export function SharePage() {
         </>
       }
       description="Have the other device scan this code, or send the six-digit code another way."
+      centered
     >
-      <div className="mt-10 grid w-full min-w-0 items-start gap-5 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
-        {/* Left Column: QR Code + One-time code */}
-        <div className="sf-rise sf-rise-1 flex w-full min-w-0 flex-col items-center self-start rounded-[1.6rem] bg-primary p-6 text-background sm:p-8 lg:sticky lg:top-8">
+      <div className="mt-8 mx-auto w-full max-w-xl min-w-0 flex flex-col items-center space-y-6">
+        {/* QR Code + One-time code card - Centered in middle */}
+        <div className="sf-rise sf-rise-1 flex w-full max-w-md min-w-0 flex-col items-center justify-center rounded-[1.8rem] bg-primary p-6 text-background sm:p-8 shadow-xl">
           <div className="mb-5 flex w-full items-center justify-between text-xs text-background/60">
             <span className="font-mono-ui uppercase tracking-[.12em]">Scan to pair</span>
-            <QrCode size={17} />
+            <QrCode size={18} />
           </div>
 
-          <div className="w-full max-w-[250px]">
+          <div className="flex w-full justify-center items-center">
             <QrCodeDisplay value={qrUrl} />
           </div>
 
-          <div className="mt-6 flex w-full items-end justify-between">
+          <div className="mt-6 flex w-full items-center justify-between rounded-xl bg-background/10 px-4 py-3 border border-background/15">
             <div>
-              <p className="text-[10px] uppercase tracking-[.14em] text-background/50">One-time code</p>
-              <p className="mt-1 font-mono-ui text-3xl font-bold tracking-[.22em]" data-testid="text-share-otp">
+              <p className="text-[10px] uppercase tracking-[.14em] text-background/60">One-time code</p>
+              <p className="mt-0.5 font-mono-ui text-3xl font-bold tracking-[.22em]" data-testid="text-share-otp">
                 {session.otp}
               </p>
             </div>
             <button
               type="button"
               onClick={() => handleCopy(session.otp, "otp")}
-              className="rounded-lg border border-background/20 p-2.5 text-background/70 hover:bg-background/10"
+              className="rounded-lg border border-background/20 p-2.5 text-background/80 hover:bg-background/20 transition-colors"
               aria-label="Copy one-time code"
               data-testid="button-copy-otp"
             >
-              {copied === "otp" ? <Check size={16} /> : <Copy size={16} />}
+              {copied === "otp" ? <Check size={18} /> : <Copy size={18} />}
             </button>
           </div>
         </div>
 
-        {/* Right Column: File details, Transfer Status, Actions */}
+        {/* File details, Transfer Status, Actions */}
         <div className="sf-rise sf-rise-2 w-full min-w-0 space-y-5">
           <div className="w-full min-w-0 rounded-2xl border border-border bg-card p-5 sm:p-6">
             <div className="flex w-full min-w-0 items-start justify-between gap-4">
