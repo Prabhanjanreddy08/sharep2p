@@ -319,7 +319,7 @@ export function LifeDropReceivePage() {
                 progress={progress}
                 speed={stats.speed}
                 transferred={stats.transferred}
-                total={session.lifedrop.totalFileSize}
+                total={stats.total || session.lifedrop?.totalFileSize || session.fileSize || 0}
                 eta={stats.eta}
                 label={
                   progress === 100

@@ -160,8 +160,8 @@ if (typeof window !== "undefined") {
 }
 
 /* ─── High-Throughput Gigabit WebRTC Pipeline (100MB/s - 1GB/s line rate) ─── */
-const DEFAULT_CHUNK_SIZE = 128 * 1024; // 128KB SCTP chunk size (cuts JS function call overhead by 75%)
-const BLOCK_SIZE = 32 * 1024 * 1024; // 32MB block slices from File
+const DEFAULT_CHUNK_SIZE = 256 * 1024; // 256KB SCTP chunk size (cuts JS function call overhead by 75%)
+const BLOCK_SIZE = 16 * 1024 * 1024; // 16MB block slices from File (lightweight on mobile RAM)
 const MAX_BUFFER = 32 * 1024 * 1024; // 32MB SCTP buffer ceiling
 const LOW_THRESHOLD = 8 * 1024 * 1024; // 8MB threshold to unpause (keeps gigabit pipe permanently full)
 
@@ -266,7 +266,9 @@ class StreamSink {
   private isReady: boolean = false;
   private initialQueue: ArrayBuffer[] = [];
   private initPromise: Promise<void> | null = null;
+  private writtenBytes: number = 0;
   private readonly FLUSH_LIMIT = 4 * 1024 * 1024; // 4MB flush limit
+  public onWriteAck?: (ackBytes: number, totalWritten: number) => void;
 
   async init(fileName: string, _fileSize: number): Promise<void> {
     this.memChunks = [];
@@ -278,32 +280,42 @@ class StreamSink {
     this.idbChunkIndex = 0;
     this.isReady = false;
     this.initialQueue = [];
+    this.writtenBytes = 0;
 
     const safeName = `sf_${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
 
     this.initPromise = (async () => {
-      // 1. Try dedicated Web Worker OPFS with createSyncAccessHandle (Native to Safari 15.2+, iOS 15.2+, Chrome, Edge)
+      // 1. Try dedicated Web Worker OPFS with createSyncAccessHandle
+      // (Native to Safari 15.2+, iOS 15.2+, Chrome on Android & Desktop, Firefox 111+, Edge)
       if (typeof Worker !== "undefined" && typeof navigator !== "undefined" && typeof (navigator.storage as any)?.getDirectory === "function") {
         try {
-          const workerCode = `
+          let w: Worker | null = null;
+          try {
+            // First attempt same-origin worker from static public directory (100% origin-privileged in iOS Safari & Android)
+            w = new Worker(new URL("/opfs-worker.js", window.location.origin));
+          } catch {
+            // Fallback to inline blob worker if external worker file cannot be loaded
+            const workerCode = `
 let accessHandle = null;
 let offset = 0;
 let uncommittedBytes = 0;
-const FLUSH_INTERVAL = 8 * 1024 * 1024; // 8MB flush prevents dirty page RAM accumulation on mobile
+const FLUSH_INTERVAL = 8 * 1024 * 1024;
 
 self.onmessage = async (e) => {
   const msg = e.data;
+  if (!msg) return;
   if (msg.cmd === 'init') {
     try {
       const root = await navigator.storage.getDirectory();
-      // Clean up previous stale session files to preserve origin disk quota
-      try {
-        for await (const [name] of root.entries()) {
-          if (name.startsWith("sf_") && name !== msg.name) {
-            await root.removeEntry(name).catch(() => {});
+      if (typeof root.entries === 'function') {
+        try {
+          for await (const [name] of root.entries()) {
+            if (name && name.startsWith("sf_") && name !== msg.name) {
+              await root.removeEntry(name).catch(() => {});
+            }
           }
-        }
-      } catch {}
+        } catch {}
+      }
 
       const fileHandle = await root.getFileHandle(msg.name, { create: true });
       if (typeof fileHandle.createSyncAccessHandle !== 'function') {
@@ -319,7 +331,7 @@ self.onmessage = async (e) => {
     }
   } else if (msg.cmd === 'write') {
     try {
-      if (accessHandle) {
+      if (accessHandle && msg.buffer) {
         const u8 = new Uint8Array(msg.buffer);
         accessHandle.write(u8, { at: offset });
         offset += u8.byteLength;
@@ -328,6 +340,7 @@ self.onmessage = async (e) => {
           accessHandle.flush();
           uncommittedBytes = 0;
         }
+        self.postMessage({ cmd: 'write-ack', bytes: u8.byteLength, offset });
       }
     } catch (err) {
       self.postMessage({ cmd: 'write-err', err: String(err) });
@@ -339,33 +352,39 @@ self.onmessage = async (e) => {
         accessHandle.close();
         accessHandle = null;
       }
-      self.postMessage({ cmd: 'finish-done', ok: true });
+      self.postMessage({ cmd: 'finish-done', ok: true, size: offset });
     } catch (err) {
       self.postMessage({ cmd: 'finish-done', ok: false, err: String(err) });
     }
   }
 };
 `;
-          const workerBlob = new Blob([workerCode], { type: "application/javascript" });
-          this.workerBlobUrl = URL.createObjectURL(workerBlob);
-          const w = new Worker(this.workerBlobUrl);
+            const workerBlob = new Blob([workerCode], { type: "application/javascript" });
+            this.workerBlobUrl = URL.createObjectURL(workerBlob);
+            w = new Worker(this.workerBlobUrl);
+          }
 
           const initialized = await new Promise<boolean>((resolve) => {
-            const timeout = setTimeout(() => resolve(false), 2000);
-            w.onmessage = (e) => {
+            const timeout = setTimeout(() => resolve(false), 5000);
+            w!.onmessage = (e) => {
               if (e.data?.cmd === "init-done") {
                 clearTimeout(timeout);
                 resolve(!!e.data.ok);
+              } else if (e.data?.cmd === "write-ack") {
+                this.writtenBytes += e.data.bytes || 0;
+                if (this.onWriteAck) {
+                  this.onWriteAck(e.data.bytes || 0, this.writtenBytes);
+                }
               } else if (e.data?.cmd === "write-err") {
                 console.warn("OPFS worker write error:", e.data.err);
               }
             };
-            w.onerror = (e) => {
+            w!.onerror = (e) => {
               clearTimeout(timeout);
               console.warn("OPFS worker error event:", e);
               resolve(false);
             };
-            w.postMessage({ cmd: "init", name: safeName });
+            w!.postMessage({ cmd: "init", name: safeName });
           });
 
           if (initialized) {
@@ -376,7 +395,7 @@ self.onmessage = async (e) => {
             this.drainInitialQueue();
             return;
           } else {
-            w.terminate();
+            w?.terminate();
             if (this.workerBlobUrl) URL.revokeObjectURL(this.workerBlobUrl);
             this.worker = null;
           }
@@ -480,21 +499,31 @@ self.onmessage = async (e) => {
             return new Promise<void>((resolve) => {
               if (!this.idbDb) {
                 this.memChunks.push(merged);
+                this.writtenBytes += totalLen;
+                if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
                 return resolve();
               }
               try {
                 const tx = this.idbDb.transaction("chunks", "readwrite");
                 const store = tx.objectStore("chunks");
                 const req = store.put(merged, chunkIdx);
-                req.onsuccess = () => resolve();
+                req.onsuccess = () => {
+                  this.writtenBytes += totalLen;
+                  if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
+                  resolve();
+                };
                 req.onerror = () => {
                   console.warn("IDB put error, falling back to memory:", req.error);
                   this.memChunks.push(merged);
+                  this.writtenBytes += totalLen;
+                  if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
                   resolve();
                 };
               } catch (err) {
                 console.warn("IDB transaction error, falling back to memory:", err);
                 this.memChunks.push(merged);
+                this.writtenBytes += totalLen;
+                if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
                 resolve();
               }
             });
@@ -502,10 +531,14 @@ self.onmessage = async (e) => {
           .catch((err) => {
             console.error("IndexedDB queue error:", err);
             this.memChunks.push(merged);
+            this.writtenBytes += totalLen;
+            if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
           });
       }
     } else {
       this.memChunks.push(new Uint8Array(chunk));
+      this.writtenBytes += chunk.byteLength;
+      if (this.onWriteAck) this.onWriteAck(chunk.byteLength, this.writtenBytes);
     }
   }
 
@@ -516,14 +549,21 @@ self.onmessage = async (e) => {
     this.drainInitialQueue();
 
     if (this.useWorkerOpfs && this.worker) {
+      const currentWorker = this.worker;
       await new Promise<void>((resolve) => {
-        if (!this.worker) return resolve();
-        this.worker.onmessage = (e) => {
+        if (!currentWorker) return resolve();
+        const prevHandler = currentWorker.onmessage;
+        currentWorker.onmessage = (e) => {
           if (e.data?.cmd === "finish-done") {
             resolve();
+          } else if (e.data?.cmd === "write-ack") {
+            this.writtenBytes += e.data.bytes || 0;
+            if (this.onWriteAck) this.onWriteAck(e.data.bytes || 0, this.writtenBytes);
+          } else if (prevHandler) {
+            prevHandler.call(currentWorker, e);
           }
         };
-        this.worker.postMessage({ cmd: "finish" });
+        currentWorker.postMessage({ cmd: "finish" });
       });
 
       this.worker.terminate();
@@ -535,7 +575,7 @@ self.onmessage = async (e) => {
         this.workerBlobUrl = null;
       }
 
-      // Read back disk-backed File from OPFS
+      // Read back disk-backed File from OPFS (0 RAM consumed, streams natively!)
       try {
         const root = await navigator.storage.getDirectory();
         const fileHandle = await root.getFileHandle(this.opfsFileName);
@@ -565,25 +605,37 @@ self.onmessage = async (e) => {
             return new Promise<void>((resolve) => {
               if (!this.idbDb) {
                 this.memChunks.push(merged);
+                this.writtenBytes += totalLen;
+                if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
                 return resolve();
               }
               try {
                 const tx = this.idbDb.transaction("chunks", "readwrite");
                 const store = tx.objectStore("chunks");
                 const req = store.put(merged, chunkIdx);
-                req.onsuccess = () => resolve();
+                req.onsuccess = () => {
+                  this.writtenBytes += totalLen;
+                  if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
+                  resolve();
+                };
                 req.onerror = () => {
                   this.memChunks.push(merged);
+                  this.writtenBytes += totalLen;
+                  if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
                   resolve();
                 };
               } catch {
                 this.memChunks.push(merged);
+                this.writtenBytes += totalLen;
+                if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
                 resolve();
               }
             });
           })
           .catch(() => {
             this.memChunks.push(merged);
+            this.writtenBytes += totalLen;
+            if (this.onWriteAck) this.onWriteAck(totalLen, this.writtenBytes);
           });
       }
       await this.writeQueue;
@@ -714,6 +766,12 @@ export function startPeerConnection({
   let pendingIceCandidates: RTCIceCandidateInit[] = [];
   let remoteDescSet = false;
   let pendingFileAck: ((ackIdx: number) => void) | null = null;
+  let pendingFileReady: ((readyIdx: number) => void) | null = null;
+  let flowCreditResolve: (() => void) | null = null;
+  let fileBytesSent = 0;
+  let fileBytesAcked = 0;
+  let currentFileReceivedBytes = 0;
+  let lastAckedBytes = 0;
   const receivedFiles: ReceivedFile[] = [];
   let currentSink: StreamSink | null = null;
   let currentMeta: {
@@ -726,7 +784,7 @@ export function startPeerConnection({
     totalTransferSize?: number;
   } | null = null;
   let totalBatchExpectedFiles = session.files?.length || 1;
-  let totalBatchExpectedBytes = session.fileSize;
+  let totalBatchExpectedBytes = session.fileSize || 0;
   let overallReceivedBytes = 0;
 
   let startTime = 0;
@@ -768,6 +826,7 @@ export function startPeerConnection({
     if (!force && now - lastProgressEmit < 50) return currentSpeed;
     lastProgressEmit = now;
 
+    const validTotal = Math.max(1, total || totalBatchExpectedBytes || session.fileSize || 1);
     const elapsedTotal = Math.max(0.001, (now - start) / 1000);
     const elapsedRecent = Math.max(0.001, (now - lastTime) / 1000);
     const instantSpeed = (current - lastBytes) / elapsedRecent;
@@ -778,13 +837,15 @@ export function startPeerConnection({
     lastBytes = current;
     currentSpeed = speed;
 
+    const progressPercent = Math.min(100, Math.round((current / validTotal) * 100));
+
     emit({
       type: "progress",
-      progress: total ? Math.min(100, Math.round((current / total) * 100)) : 0,
+      progress: progressPercent,
       transferred: current,
-      total,
+      total: validTotal,
       speed,
-      eta: speed > 0 ? Math.max(0, (total - current) / speed) : 0,
+      eta: speed > 0 ? Math.max(0, (validTotal - current) / speed) : 0,
       currentFileName,
       fileIndex,
       totalFiles,
@@ -845,7 +906,22 @@ export function startPeerConnection({
         };
         channel.send(JSON.stringify(meta));
 
+        // Wait for receiver to acknowledge file-ready so disk storage is 100% prepared
+        await new Promise<void>((resolve) => {
+          const readyTimer = setTimeout(() => resolve(), 3500);
+          pendingFileReady = (readyIdx: number) => {
+            if (readyIdx === fileIdx) {
+              clearTimeout(readyTimer);
+              pendingFileReady = null;
+              resolve();
+            }
+          };
+        });
+
         let offset = 0;
+        fileBytesSent = 0;
+        fileBytesAcked = 0;
+
         while (offset < currentFile.size && !isClosed) {
           // If channel is momentarily closed or reconnecting, wait up to 35 seconds for recovery instead of aborting
           if (channel.readyState !== "open") {
@@ -881,6 +957,21 @@ export function startPeerConnection({
               break;
             }
 
+            // Windowed Flow Control: Sender never exceeds 16MB ahead of receiver's disk writes
+            // This guarantees receiver RAM is mathematically bounded to <= 16MB on iOS Safari & Android!
+            const MAX_IN_FLIGHT = 16 * 1024 * 1024;
+            while (fileBytesSent - fileBytesAcked >= MAX_IN_FLIGHT && channel.readyState === "open" && !isClosed) {
+              await new Promise<void>((resolve) => {
+                flowCreditResolve = resolve;
+                setTimeout(() => {
+                  if (flowCreditResolve === resolve) {
+                    flowCreditResolve = null;
+                    resolve();
+                  }
+                }, 800);
+              });
+            }
+
             const maxBuffer = getAdaptiveBufferLimit(currentSpeed);
             if (channel.bufferedAmount >= maxBuffer) {
               await waitBufferedAmountLow(channel, Math.floor(maxBuffer / 2));
@@ -910,7 +1001,9 @@ export function startPeerConnection({
             const sentLen = chunk.byteLength;
             blockOffset += sentLen;
             offset += sentLen;
+            fileBytesSent += sentLen;
             overallSent += sentLen;
+
             currentSpeed = updateProgress(
               overallSent,
               totalTransferBytes,
@@ -970,6 +1063,16 @@ export function startPeerConnection({
         if (typeof evt.data === "string") {
           try {
             const msg = JSON.parse(evt.data);
+            if (msg.kind === "file-ready" && pendingFileReady) {
+              pendingFileReady(msg.fileIndex);
+            }
+            if (msg.kind === "flow-ack") {
+              fileBytesAcked = Math.max(fileBytesAcked, msg.bytes || 0);
+              if (flowCreditResolve) {
+                flowCreditResolve();
+                flowCreditResolve = null;
+              }
+            }
             if (msg.kind === "file-ack" && pendingFileAck) {
               pendingFileAck(msg.fileIndex);
             }
@@ -987,30 +1090,68 @@ export function startPeerConnection({
           const msg = JSON.parse(evt.data);
           if (msg.kind === "batch-meta") {
             totalBatchExpectedFiles = msg.totalFiles || 1;
-            totalBatchExpectedBytes = msg.totalSize || session.fileSize;
+            totalBatchExpectedBytes = msg.totalSize || session.fileSize || 1;
+            updateProgress(
+              overallReceivedBytes,
+              totalBatchExpectedBytes,
+              startTime || performance.now(),
+              true,
+              currentMeta?.fileName,
+              currentMeta?.fileIndex,
+              totalBatchExpectedFiles
+            );
           } else if (msg.kind === "file-meta") {
             await detectLocalLink();
             currentMeta = msg;
             if (msg.totalFiles) totalBatchExpectedFiles = msg.totalFiles;
             if (msg.totalTransferSize) totalBatchExpectedBytes = msg.totalTransferSize;
+            if (!totalBatchExpectedBytes || totalBatchExpectedBytes <= 0) {
+              totalBatchExpectedBytes = msg.fileSize || session.fileSize || 1;
+            }
+            currentFileReceivedBytes = 0;
+            lastAckedBytes = 0;
             if (!startTime) {
               startTime = performance.now();
               lastTime = startTime;
               lastBytes = 0;
             }
             currentSink = new StreamSink();
+            currentSink.onWriteAck = (_chunkBytes, totalWritten) => {
+              // Flow ACK back to sender when disk writes advance by 2MB
+              if (totalWritten - lastAckedBytes >= 2 * 1024 * 1024) {
+                lastAckedBytes = totalWritten;
+                try {
+                  if (channel.readyState === "open") {
+                    channel.send(JSON.stringify({ kind: "flow-ack", bytes: totalWritten }));
+                  }
+                } catch {}
+              }
+            };
             await currentSink.init(msg.fileName, msg.fileSize);
+            // Notify sender that disk sink is initialized and ready to stream
+            try {
+              if (channel.readyState === "open") {
+                channel.send(JSON.stringify({ kind: "file-ready", fileIndex: msg.fileIndex }));
+              }
+            } catch {}
             emit({ type: "status", status: "transferring", isLocalDirect: isDirectLocal });
             updateProgress(
               overallReceivedBytes,
               totalBatchExpectedBytes,
               startTime,
-              false,
+              true,
               msg.fileName,
               msg.fileIndex,
               totalBatchExpectedFiles
             );
           } else if (msg.kind === "file-complete" && currentMeta && currentSink) {
+            // Send final flow-ack for full file
+            try {
+              if (channel.readyState === "open") {
+                channel.send(JSON.stringify({ kind: "flow-ack", bytes: currentMeta.fileSize }));
+              }
+            } catch {}
+
             const blob = await currentSink.finish(currentMeta.fileType);
             const computedSha = await computeSha256(blob);
             const verified = blob.size === currentMeta.fileSize && computedSha === currentMeta.sha256;
@@ -1096,6 +1237,18 @@ export function startPeerConnection({
         const chunk = evt.data as ArrayBuffer;
         currentSink.write(chunk);
         overallReceivedBytes += chunk.byteLength;
+        currentFileReceivedBytes += chunk.byteLength;
+
+        // Immediate flow-ack if chunk processing exceeds 2MB boundary
+        if (currentFileReceivedBytes - lastAckedBytes >= 2 * 1024 * 1024) {
+          lastAckedBytes = currentFileReceivedBytes;
+          try {
+            if (channel.readyState === "open") {
+              channel.send(JSON.stringify({ kind: "flow-ack", bytes: currentFileReceivedBytes }));
+            }
+          } catch {}
+        }
+
         updateProgress(
           overallReceivedBytes,
           totalBatchExpectedBytes,

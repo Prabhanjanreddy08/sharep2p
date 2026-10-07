@@ -229,7 +229,7 @@ export function LifeDropSharePage() {
               progress={progress}
               speed={stats.speed}
               transferred={stats.transferred}
-              total={session.lifedrop?.totalFileSize || 0}
+              total={stats.total || session.lifedrop?.totalFileSize || session.fileSize || 0}
               eta={stats.eta}
               label={
                 progress === 100

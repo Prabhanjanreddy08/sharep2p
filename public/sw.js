@@ -24,6 +24,69 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
+  // Handle Zero-Memory IndexedDB streaming downloads
+  if (url.pathname === "/sw-download") {
+    const dbName = url.searchParams.get("db");
+    const fileName = url.searchParams.get("name") || "download";
+    const fileType = url.searchParams.get("type") || "application/octet-stream";
+    const fileSize = url.searchParams.get("size");
+
+    if (!dbName) {
+      event.respondWith(new Response("Missing database parameter", { status: 400 }));
+      return;
+    }
+
+    event.respondWith(
+      new Promise((resolve) => {
+        const req = indexedDB.open(dbName, 1);
+        req.onerror = () => resolve(new Response("Failed to open storage", { status: 500 }));
+        req.onsuccess = () => {
+          const db = req.result;
+          let tx = null;
+          try {
+            tx = db.transaction("chunks", "readonly");
+          } catch (e) {
+            return resolve(new Response("Store not found", { status: 500 }));
+          }
+          const store = tx.objectStore("chunks");
+
+          const cursorReq = store.openCursor();
+          const stream = new ReadableStream({
+            start(controller) {
+              cursorReq.onsuccess = (e) => {
+                const cursor = e.target.result;
+                if (cursor) {
+                  controller.enqueue(cursor.value);
+                  cursor.continue();
+                } else {
+                  controller.close();
+                  try {
+                    db.close();
+                    indexedDB.deleteDatabase(dbName);
+                  } catch {}
+                }
+              };
+              cursorReq.onerror = () => {
+                controller.error(cursorReq.error);
+                try { db.close(); } catch {}
+              };
+            }
+          });
+
+          const headers = new Headers();
+          headers.set("Content-Type", fileType);
+          headers.set("Content-Disposition", `attachment; filename="${encodeURIComponent(fileName)}"`);
+          if (fileSize) {
+            headers.set("Content-Length", fileSize);
+          }
+
+          resolve(new Response(stream, { headers }));
+        };
+      })
+    );
+    return;
+  }
+
   // Do not cache API or WebSocket requests
   if (url.pathname.startsWith("/api") || url.pathname.startsWith("/ws")) {
     return;

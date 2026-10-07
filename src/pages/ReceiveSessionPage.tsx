@@ -276,7 +276,7 @@ export function ReceiveSessionPage() {
               progress={progress}
               speed={stats.speed}
               transferred={stats.transferred}
-              total={session.fileSize}
+              total={stats.total || session.fileSize || 0}
               eta={stats.eta}
               label={
                 isAllComplete
