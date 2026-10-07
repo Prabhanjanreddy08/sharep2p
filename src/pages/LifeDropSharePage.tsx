@@ -150,39 +150,38 @@ export function LifeDropSharePage() {
       eyebrow="02 / LifeDrop"
       title={<>Your drop is<br /><em>ready to go.</em></>}
       description="Have the other device scan this code. Text items transfer instantly — files go peer-to-peer."
-      centered
     >
-      <div className="mt-8 mx-auto w-full max-w-xl min-w-0 flex flex-col items-center space-y-6">
-        {/* QR + OTP Card - Centered in Middle */}
-        <div className="sf-rise sf-rise-1 flex w-full max-w-md min-w-0 flex-col items-center justify-center rounded-[1.8rem] bg-primary p-6 text-background sm:p-8 shadow-xl">
+      <div className="mt-10 grid w-full min-w-0 items-start gap-5 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+        {/* Left Column: QR + OTP (compact height) */}
+        <div className="sf-rise sf-rise-1 flex w-full min-w-0 flex-col items-center self-start rounded-[1.6rem] bg-primary p-6 text-background sm:p-8 lg:sticky lg:top-8">
           <div className="mb-5 flex w-full items-center justify-between text-xs text-background/60">
             <span className="font-mono-ui uppercase tracking-[.12em]">Scan to pick up</span>
-            <QrCode size={18} />
+            <QrCode size={17} />
           </div>
 
-          <div className="flex w-full justify-center items-center">
+          <div className="w-full max-w-[250px] flex justify-center">
             <QrCodeDisplay value={qrUrl} />
           </div>
 
-          <div className="mt-6 flex w-full items-center justify-between rounded-xl bg-background/10 px-4 py-3 border border-background/15">
+          <div className="mt-6 flex w-full items-end justify-between">
             <div>
-              <p className="text-[10px] uppercase tracking-[.14em] text-background/60">One-time code</p>
-              <p className="mt-0.5 font-mono-ui text-3xl font-bold tracking-[.22em]">
+              <p className="text-[10px] uppercase tracking-[.14em] text-background/50">One-time code</p>
+              <p className="mt-1 font-mono-ui text-3xl font-bold tracking-[.22em]">
                 {session.otp}
               </p>
             </div>
             <button
               type="button"
               onClick={() => handleCopy(session.otp, "otp")}
-              className="rounded-lg border border-background/20 p-2.5 text-background/80 hover:bg-background/20 transition-colors"
+              className="rounded-lg border border-background/20 p-2.5 text-background/70 hover:bg-background/10"
               aria-label="Copy one-time code"
             >
-              {copied === "otp" ? <Check size={18} /> : <Copy size={18} />}
+              {copied === "otp" ? <Check size={16} /> : <Copy size={16} />}
             </button>
           </div>
         </div>
 
-        {/* Package summary */}
+        {/* Right Column: Package summary */}
         <div className="sf-rise sf-rise-2 w-full min-w-0 space-y-4">
           {/* Package header */}
           <div className="w-full min-w-0 rounded-2xl border border-border bg-card p-5 sm:p-6">

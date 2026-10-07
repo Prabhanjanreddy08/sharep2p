@@ -399,26 +399,15 @@ wss.on("connection", (ws, req) => {
   }
 
   if (role === "sender") {
-    if (session.senderWs && session.senderWs !== ws && session.senderWs.readyState === WebSocket.OPEN) {
-      session.senderWs.close();
-    }
     session.senderWs = ws;
-  } else {
-    if (session.receiverWs && session.receiverWs !== ws && session.receiverWs.readyState === WebSocket.OPEN) {
-      session.receiverWs.close();
+    if (session.receiverWs && session.receiverWs.readyState === WebSocket.OPEN) {
+      session.senderWs.send(JSON.stringify({ type: "peer-connected" }));
     }
+  } else {
     session.receiverWs = ws;
-  }
-
-  // When both peers are connected (or reconnected), notify both sides
-  if (
-    session.senderWs &&
-    session.senderWs.readyState === WebSocket.OPEN &&
-    session.receiverWs &&
-    session.receiverWs.readyState === WebSocket.OPEN
-  ) {
-    session.senderWs.send(JSON.stringify({ type: "peer-connected" }));
-    session.receiverWs.send(JSON.stringify({ type: "peer-connected" }));
+    if (session.senderWs && session.senderWs.readyState === WebSocket.OPEN) {
+      session.senderWs.send(JSON.stringify({ type: "peer-connected" }));
+    }
   }
 
   // Keep connection alive through proxies (Render, mobile NATs) with 20s ping
@@ -465,10 +454,11 @@ wss.on("connection", (ws, req) => {
     if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
     session.disconnectTimer = setTimeout(() => {
       session.disconnectTimer = null;
-      const isSenderMissing = !session.senderWs || session.senderWs.readyState !== WebSocket.OPEN;
-      const isReceiverMissing = !session.receiverWs || session.receiverWs.readyState !== WebSocket.OPEN;
+      const isMissing = role === "sender"
+        ? (!session.senderWs || session.senderWs.readyState !== WebSocket.OPEN)
+        : (!session.receiverWs || session.receiverWs.readyState !== WebSocket.OPEN);
 
-      if (isSenderMissing || isReceiverMissing) {
+      if (isMissing) {
         const peer = role === "sender" ? session.receiverWs : session.senderWs;
         if (peer && peer.readyState === WebSocket.OPEN) {
           peer.send(JSON.stringify({ type: "peer-disconnected", role }));
