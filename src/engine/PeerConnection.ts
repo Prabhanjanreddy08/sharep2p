@@ -219,12 +219,12 @@ function waitBufferedAmountLow(channel: RTCDataChannel, threshold: number): Prom
     const onLow = () => cleanup();
     channel.addEventListener("bufferedamountlow", onLow, { once: true });
 
-    // Active polling safety timer: checks every 1ms so SCTP pipeline never stalls
+    // Active polling safety timer: checks every 4ms so SCTP pipeline never stalls
     timer = setInterval(() => {
       if (channel.readyState !== "open" || channel.bufferedAmount <= threshold) {
         cleanup();
       }
-    }, 1);
+    }, 4);
   });
 }
 
@@ -288,12 +288,23 @@ class StreamSink {
           const workerCode = `
 let accessHandle = null;
 let offset = 0;
+let uncommittedBytes = 0;
+const FLUSH_INTERVAL = 8 * 1024 * 1024; // 8MB flush prevents dirty page RAM accumulation on mobile
 
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.cmd === 'init') {
     try {
       const root = await navigator.storage.getDirectory();
+      // Clean up previous stale session files to preserve origin disk quota
+      try {
+        for await (const [name] of root.entries()) {
+          if (name.startsWith("sf_") && name !== msg.name) {
+            await root.removeEntry(name).catch(() => {});
+          }
+        }
+      } catch {}
+
       const fileHandle = await root.getFileHandle(msg.name, { create: true });
       if (typeof fileHandle.createSyncAccessHandle !== 'function') {
         throw new Error('createSyncAccessHandle not supported');
@@ -301,6 +312,7 @@ self.onmessage = async (e) => {
       accessHandle = await fileHandle.createSyncAccessHandle();
       accessHandle.truncate(0);
       offset = 0;
+      uncommittedBytes = 0;
       self.postMessage({ cmd: 'init-done', ok: true });
     } catch (err) {
       self.postMessage({ cmd: 'init-done', ok: false, err: String(err) });
@@ -311,6 +323,11 @@ self.onmessage = async (e) => {
         const u8 = new Uint8Array(msg.buffer);
         accessHandle.write(u8, { at: offset });
         offset += u8.byteLength;
+        uncommittedBytes += u8.byteLength;
+        if (uncommittedBytes >= FLUSH_INTERVAL) {
+          accessHandle.flush();
+          uncommittedBytes = 0;
+        }
       }
     } catch (err) {
       self.postMessage({ cmd: 'write-err', err: String(err) });
@@ -339,10 +356,13 @@ self.onmessage = async (e) => {
               if (e.data?.cmd === "init-done") {
                 clearTimeout(timeout);
                 resolve(!!e.data.ok);
+              } else if (e.data?.cmd === "write-err") {
+                console.warn("OPFS worker write error:", e.data.err);
               }
             };
-            w.onerror = () => {
+            w.onerror = (e) => {
               clearTimeout(timeout);
+              console.warn("OPFS worker error event:", e);
               resolve(false);
             };
             w.postMessage({ cmd: "init", name: safeName });
@@ -826,13 +846,41 @@ export function startPeerConnection({
         channel.send(JSON.stringify(meta));
 
         let offset = 0;
-        while (offset < currentFile.size && channel.readyState === "open" && !isClosed) {
+        while (offset < currentFile.size && !isClosed) {
+          // If channel is momentarily closed or reconnecting, wait up to 35 seconds for recovery instead of aborting
+          if (channel.readyState !== "open") {
+            const reconnected = await new Promise<boolean>((resolve) => {
+              const checkInterval = setInterval(() => {
+                if (channel.readyState === "open") {
+                  clearInterval(checkInterval);
+                  resolve(true);
+                } else if (isClosed || isTransferComplete) {
+                  clearInterval(checkInterval);
+                  resolve(false);
+                }
+              }, 250);
+              setTimeout(() => {
+                clearInterval(checkInterval);
+                resolve(channel.readyState === "open");
+              }, 35_000);
+            });
+            if (!reconnected || isClosed) {
+              console.warn("Channel failed to recover within 35s. Transfer halted.");
+              break;
+            }
+          }
+
           const blockEnd = Math.min(currentFile.size, offset + BLOCK_SIZE);
           const blockSlice = currentFile.slice(offset, blockEnd);
           const blockBuffer = await blockSlice.arrayBuffer();
 
           let blockOffset = 0;
-          while (blockOffset < blockBuffer.byteLength && channel.readyState === "open" && !isClosed) {
+          while (blockOffset < blockBuffer.byteLength && !isClosed) {
+            if (channel.readyState !== "open") {
+              // Channel dropped during block transmission; break block loop so outer loop can wait and resume from offset
+              break;
+            }
+
             const maxBuffer = getAdaptiveBufferLimit(currentSpeed);
             if (channel.bufferedAmount >= maxBuffer) {
               await waitBufferedAmountLow(channel, Math.floor(maxBuffer / 2));
@@ -852,6 +900,11 @@ export function startPeerConnection({
                 console.warn("Buffer full, pausing briefly...", err);
                 await waitBufferedAmountLow(channel, 32 * 1024);
               }
+            }
+
+            if (!sent && channel.readyState !== "open") {
+              // Could not send because channel dropped; break block loop to let outer loop wait for reconnection
+              break;
             }
 
             const sentLen = chunk.byteLength;
@@ -1068,10 +1121,7 @@ export function startPeerConnection({
         console.log("Channel closed after transfer completed. Disconnect suppressed.");
         return;
       }
-      if (currentMeta && overallReceivedBytes < totalBatchExpectedBytes) {
-        emit({ type: "status", status: "disconnected", message: "The transfer connection was interrupted." });
-        releaseWakeLock();
-      }
+      console.log("DataChannel closed/paused. Waiting for recovery...");
     };
   };
 
@@ -1082,6 +1132,46 @@ export function startPeerConnection({
   };
 
   let iceDisconnectTimer: any = null;
+
+  const handleConnectionRecovery = (stateName: string) => {
+    if (isTransferComplete || isClosed) return;
+
+    console.log(`WebRTC ${stateName} triggered. Attempting automatic ICE restart...`);
+    if (role === "sender") {
+      try {
+        pc.restartIce();
+        pc.createOffer({ iceRestart: true })
+          .then((offer) => pc.setLocalDescription(offer))
+          .then(() => sendSignaling({ type: "offer", payload: pc.localDescription }))
+          .catch((e) => console.warn("ICE restart offer failed:", e));
+      } catch (e) {
+        console.warn("ICE restart invocation failed:", e);
+      }
+    }
+
+    if (!iceDisconnectTimer) {
+      iceDisconnectTimer = setTimeout(() => {
+        iceDisconnectTimer = null;
+        if (
+          (pc.connectionState === "disconnected" ||
+            pc.connectionState === "failed" ||
+            pc.iceConnectionState === "disconnected" ||
+            pc.iceConnectionState === "failed") &&
+          !isClosed &&
+          !isTransferComplete
+        ) {
+          emit({
+            type: "status",
+            status: "error",
+            message: "Direct P2P connection interrupted. Retrying...",
+          });
+          releaseWakeLock();
+          backgroundKeepAlive.stop();
+        }
+      }, 35_000);
+    }
+  };
+
   pc.onconnectionstatechange = () => {
     if (isTransferComplete) {
       console.log("Peer connection state changed after transfer completed. Disconnect suppressed.");
@@ -1097,29 +1187,25 @@ export function startPeerConnection({
         status: dataChannelRef?.readyState === "open" ? "transferring" : "connected",
         isLocalDirect: isDirectLocal,
       });
-    } else if (pc.connectionState === "disconnected") {
-      // Mobile app switching temporarily sets ICE to disconnected. Give 35s to restore.
-      if (!iceDisconnectTimer) {
-        iceDisconnectTimer = setTimeout(() => {
-          iceDisconnectTimer = null;
-          if (pc.connectionState === "disconnected" && !isClosed && !isTransferComplete) {
-            emit({ type: "status", status: "disconnected", message: "The other device disconnected." });
-            releaseWakeLock();
-            backgroundKeepAlive.stop();
-          }
-        }, 35_000);
+    } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+      handleConnectionRecovery(`connectionState:${pc.connectionState}`);
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    if (isTransferComplete) return;
+    if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+      if (iceDisconnectTimer) {
+        clearTimeout(iceDisconnectTimer);
+        iceDisconnectTimer = null;
       }
-    } else if (pc.connectionState === "failed") {
-      try {
-        pc.restartIce();
-      } catch {}
-      setTimeout(() => {
-        if (pc.connectionState === "failed" && !isClosed && !isTransferComplete) {
-          emit({ type: "status", status: "error", message: "Direct P2P connection failed. Check network and try again." });
-          releaseWakeLock();
-          backgroundKeepAlive.stop();
-        }
-      }, 10_000);
+      emit({
+        type: "status",
+        status: dataChannelRef?.readyState === "open" ? "transferring" : "connected",
+        isLocalDirect: isDirectLocal,
+      });
+    } else if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+      handleConnectionRecovery(`iceConnectionState:${pc.iceConnectionState}`);
     }
   };
 
