@@ -7,7 +7,7 @@ import { ExpiryTimer } from "../components/ExpiryTimer";
 import { TransferStatus } from "../components/TransferStatus";
 import { StatusMessage } from "../components/StatusMessage";
 import { formatBytes } from "../components/Formatters";
-import { getCachedActiveFiles, getCachedActiveFile, cacheActiveFiles, cacheActiveFile } from "../engine/fileCache";
+import { getCachedActiveFiles, getCachedActiveFile, cacheActiveFiles, cacheActiveFile, getActiveFilesInMemory } from "../engine/fileCache";
 import { startPeerConnection, ActiveSession } from "../engine/PeerConnection";
 import { apiUrl } from "../config";
 import { QrCode, Copy, Check, LockKeyhole, X, Radio, ArrowRight, Upload, Zap, Wifi, Globe, Files } from "lucide-react";
@@ -26,7 +26,8 @@ export function SharePage() {
     return null;
   });
 
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<File[]>(() => getActiveFilesInMemory());
+  const [isFilesLoaded, setIsFilesLoaded] = useState(() => getActiveFilesInMemory().length > 0);
   const [currentFileMeta, setCurrentFileMeta] = useState<{ name: string; index: number; total: number } | null>(null);
   const [copied, setCopied] = useState<"otp" | "link" | "">("");
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("waiting");
@@ -47,11 +48,12 @@ export function SharePage() {
           if (single) setFiles([single]);
         });
       }
+      setIsFilesLoaded(true);
     });
   }, []);
 
   useEffect(() => {
-    if (!session) return;
+    if (!session || !isFilesLoaded) return;
     if (files.length === 0) {
       setStatus("error");
       statusRef.current = "error";

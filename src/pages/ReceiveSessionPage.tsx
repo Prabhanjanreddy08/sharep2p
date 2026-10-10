@@ -58,11 +58,24 @@ export function ReceiveSessionPage() {
   }, []);
 
   const createDownloadItem = (file: { blob: Blob; fileName: string; fileSize?: number; fileType?: string; verified: boolean }): CompletedItem => {
+    let cleanName = (file.fileName || "download").trim().replace(/[/\\?%*:|"<>]/g, "_");
+    if (!cleanName.includes(".")) {
+      const type = file.fileType || "";
+      if (type.includes("jpeg") || type.includes("jpg")) cleanName += ".jpg";
+      else if (type.includes("png")) cleanName += ".png";
+      else if (type.includes("webp")) cleanName += ".webp";
+      else if (type.includes("gif")) cleanName += ".gif";
+      else if (type.includes("mp4")) cleanName += ".mp4";
+      else if (type.includes("pdf")) cleanName += ".pdf";
+      else if (type.includes("zip")) cleanName += ".zip";
+      else cleanName += ".file";
+    }
+
     const downloadUrl = URL.createObjectURL(file.blob);
     createdUrlsRef.current.push(downloadUrl);
     return {
       blob: file.blob,
-      fileName: file.fileName,
+      fileName: cleanName,
       fileSize: file.fileSize ?? file.blob.size,
       fileType: file.fileType || "application/octet-stream",
       verified: file.verified,
@@ -174,7 +187,29 @@ export function ReceiveSessionPage() {
   const handleSaveFile = async (item: CompletedItem) => {
     const safeName = item.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
 
-    // 1. Desktop Chromium: showSaveFilePicker with explicit writable.write and writable.close
+    // 1. Mobile Web Share for photos/images (Allows directly saving to iOS Camera Roll or Android Gallery)
+    if (
+      item.fileType?.startsWith("image/") &&
+      typeof navigator !== "undefined" &&
+      typeof (navigator as any).share === "function" &&
+      typeof (navigator as any).canShare === "function"
+    ) {
+      try {
+        const fileObj = new File([item.blob], safeName, { type: item.fileType });
+        if ((navigator as any).canShare({ files: [fileObj] })) {
+          await (navigator as any).share({
+            files: [fileObj],
+            title: safeName,
+          });
+          setSavedFileNames((prev) => new Set(prev).add(item.fileName));
+          return;
+        }
+      } catch (err: any) {
+        if (err.name === "AbortError") return;
+      }
+    }
+
+    // 2. Desktop Chromium: showSaveFilePicker with explicit writable.write and writable.close
     if (typeof (window as any).showSaveFilePicker === "function") {
       try {
         const handle = await (window as any).showSaveFilePicker({
@@ -191,14 +226,18 @@ export function ReceiveSessionPage() {
       }
     }
 
-    // 2. Mobile (Android/iOS) & Standard browser fallback: Anchor tag click
+    // 3. Mobile (Android/iOS) & Standard browser fallback: Anchor tag click
     try {
       const a = document.createElement("a");
       a.href = item.downloadUrl;
       a.download = safeName;
       document.body.appendChild(a);
       a.click();
-      document.body.removeChild(a);
+      setTimeout(() => {
+        try {
+          document.body.removeChild(a);
+        } catch {}
+      }, 1000);
       setSavedFileNames((prev) => new Set(prev).add(item.fileName));
     } catch (e) {
       console.error("Failed to trigger download anchor:", e);

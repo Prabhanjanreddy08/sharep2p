@@ -60,29 +60,51 @@ export function LifeDropReceivePage() {
   const [stats, setStats] = useState({ transferred: 0, total: 0, speed: 0, eta: 0 });
   const [status, setStatus] = useState<"connecting" | "waiting" | "connected" | "transferring" | "complete" | "error" | "disconnected">("connecting");
   const [statusMessage, setStatusMessage] = useState("");
-  const [downloadTriggered, setDownloadTriggered] = useState(false);
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-  const [completedFile, setCompletedFile] = useState<{ blob: Blob; fileName: string; verified: boolean } | null>(null);
+  const [completedFiles, setCompletedFiles] = useState<CompletedItem[]>([]);
+  const [savedFileNames, setSavedFileNames] = useState<Set<string>>(new Set());
+  const [isSavingAll, setIsSavingAll] = useState(false);
   const [copiedId, setCopiedId] = useState("");
 
-  const completedFileRef = useRef<{ blob: Blob; fileName: string; verified: boolean } | null>(null);
+  const completedFilesRef = useRef<CompletedItem[]>([]);
   const progressRef = useRef(0);
+  const createdUrlsRef = useRef<string[]>([]);
 
-  // Generate a stable download URL when file is ready; revoked only on unmount
+  // Revoke object URLs on unmount
   useEffect(() => {
-    if (!completedFile) return;
-    try {
-      const url = URL.createObjectURL(completedFile.blob);
-      setDownloadUrl(url);
-      return () => {
+    return () => {
+      for (const url of createdUrlsRef.current) {
         try {
           URL.revokeObjectURL(url);
         } catch {}
-      };
-    } catch (e) {
-      console.error("LifeDrop download URL error:", e);
+      }
+    };
+  }, []);
+
+  const createDownloadItem = (file: { blob: Blob; fileName: string; fileSize?: number; fileType?: string; verified: boolean }): CompletedItem => {
+    let cleanName = (file.fileName || "download").trim().replace(/[/\\?%*:|"<>]/g, "_");
+    if (!cleanName.includes(".")) {
+      const type = file.fileType || "";
+      if (type.includes("jpeg") || type.includes("jpg")) cleanName += ".jpg";
+      else if (type.includes("png")) cleanName += ".png";
+      else if (type.includes("webp")) cleanName += ".webp";
+      else if (type.includes("gif")) cleanName += ".gif";
+      else if (type.includes("mp4")) cleanName += ".mp4";
+      else if (type.includes("pdf")) cleanName += ".pdf";
+      else if (type.includes("zip")) cleanName += ".zip";
+      else cleanName += ".file";
     }
-  }, [completedFile]);
+
+    const downloadUrl = URL.createObjectURL(file.blob);
+    createdUrlsRef.current.push(downloadUrl);
+    return {
+      blob: file.blob,
+      fileName: cleanName,
+      fileSize: file.fileSize ?? file.blob.size,
+      fileType: file.fileType || "application/octet-stream",
+      verified: file.verified,
+      downloadUrl,
+    };
+  };
 
   const fileItems = (session?.lifedrop?.items || []).filter((i) => i.kind === "file" || i.kind === "photo");
   const textItems = (session?.lifedrop?.items || []).filter((i) => i.kind !== "file" && i.kind !== "photo");
@@ -109,7 +131,7 @@ export function LifeDropReceivePage() {
       onEvent: (evt) => {
         if (evt.type === "status") {
           // If transfer already completed, do not revert to disconnected or error
-          if (completedFileRef.current || progressRef.current === 100) {
+          if (completedFilesRef.current.length > 0 || progressRef.current === 100) {
             console.log("LifeDrop ignoring status change after transfer completion:", evt.status);
             return;
           }
@@ -119,20 +141,36 @@ export function LifeDropReceivePage() {
           setProgress(evt.progress);
           progressRef.current = evt.progress;
           setStats({ transferred: evt.transferred, total: evt.total, speed: evt.speed, eta: evt.eta });
+        } else if (evt.type === "file-complete") {
+          const newItem = createDownloadItem(evt.file);
+          setCompletedFiles((prev) => {
+            const exists = prev.some((p) => p.fileName === newItem.fileName && p.fileSize === newItem.fileSize);
+            const updated = exists ? prev : [...prev, newItem];
+            completedFilesRef.current = updated;
+            return updated;
+          });
         } else if (evt.type === "complete") {
-          const blob = evt.blob || evt.files?.[0]?.blob;
-          const fileName = evt.fileName || evt.files?.[0]?.fileName || "download";
-          if (blob) {
-            const fileData = { blob, fileName, verified: evt.verified };
-            completedFileRef.current = fileData;
-            setCompletedFile(fileData);
+          let finalItems: CompletedItem[] = [];
+          if (evt.files && evt.files.length > 0) {
+            finalItems = evt.files.map((f) => createDownloadItem(f));
+          } else if (evt.blob && evt.fileName) {
+            finalItems = [
+              createDownloadItem({
+                blob: evt.blob,
+                fileName: evt.fileName,
+                fileType: evt.fileType,
+                verified: evt.verified,
+              }),
+            ];
+          }
+          if (finalItems.length > 0) {
+            completedFilesRef.current = finalItems;
+            setCompletedFiles(finalItems);
           }
           setStatus("complete");
           setProgress(100);
           progressRef.current = 100;
-          setStatusMessage("Transfer complete! File is ready on this device.");
-
-          // DO NOT automatically download: keep screen stable and let the user tap Save
+          setStatusMessage("Transfer complete! File(s) are ready on this device.");
         }
       },
     });
@@ -169,29 +207,73 @@ export function LifeDropReceivePage() {
     );
   }
 
-  const handleSaveFileClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
-    if (!completedFile) return;
-    const safeName = completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
+  const handleSaveFile = async (item: CompletedItem) => {
+    const safeName = item.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download";
 
+    // 1. Mobile Web Share for photos/images (Save directly to iOS Camera Roll or Android Gallery)
+    if (
+      item.fileType?.startsWith("image/") &&
+      typeof navigator !== "undefined" &&
+      typeof (navigator as any).share === "function" &&
+      typeof (navigator as any).canShare === "function"
+    ) {
+      try {
+        const fileObj = new File([item.blob], safeName, { type: item.fileType });
+        if ((navigator as any).canShare({ files: [fileObj] })) {
+          await (navigator as any).share({
+            files: [fileObj],
+            title: safeName,
+          });
+          setSavedFileNames((prev) => new Set(prev).add(item.fileName));
+          return;
+        }
+      } catch (err: any) {
+        if (err.name === "AbortError") return;
+      }
+    }
+
+    // 2. Desktop Chromium: showSaveFilePicker
     if (typeof (window as any).showSaveFilePicker === "function") {
-      e.preventDefault();
       try {
         const handle = await (window as any).showSaveFilePicker({
           suggestedName: safeName,
         });
         const writable = await handle.createWritable();
-        await writable.write(completedFile.blob);
+        await writable.write(item.blob);
         await writable.close();
-        setDownloadTriggered(true);
+        setSavedFileNames((prev) => new Set(prev).add(item.fileName));
         return;
       } catch (err: any) {
         if (err.name === "AbortError") return;
-        if (downloadUrl) {
-          window.open(downloadUrl, "_self");
-        }
       }
     }
-    setDownloadTriggered(true);
+
+    // 3. Universal Anchor Download
+    try {
+      const a = document.createElement("a");
+      a.href = item.downloadUrl;
+      a.download = safeName;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        try {
+          document.body.removeChild(a);
+        } catch {}
+      }, 1000);
+      setSavedFileNames((prev) => new Set(prev).add(item.fileName));
+    } catch (e) {
+      console.error("Failed to trigger download anchor:", e);
+    }
+  };
+
+  const handleSaveAllFiles = async () => {
+    if (completedFiles.length === 0 || isSavingAll) return;
+    setIsSavingAll(true);
+    for (let i = 0; i < completedFiles.length; i++) {
+      await handleSaveFile(completedFiles[i]);
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    setIsSavingAll(false);
   };
 
   const handleCopyText = async (text: string, itemId: string) => {
@@ -211,7 +293,7 @@ export function LifeDropReceivePage() {
     <PageContainer
       eyebrow="02 / LifeDrop"
       title={
-        (completedFile || !hasFiles) ? (
+        (completedFiles.length > 0 || !hasFiles) ? (
           <>Your drop<br /><em>has arrived.</em></>
         ) : (
           <>A drop is<br /><em>on its way.</em></>
@@ -334,34 +416,88 @@ export function LifeDropReceivePage() {
                 }
               />
 
-              {completedFile && (
+              {completedFiles.length > 0 && (
                 <div className="mt-5 space-y-3">
-                  <a
-                    href={downloadUrl || "#"}
-                    download={completedFile.fileName.replace(/[/\\?%*:|"<>]/g, "_").trim() || "download"}
-                    onClick={handleSaveFileClick}
-                    className="flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-background transition-transform hover:-translate-y-0.5 shadow-lg active:scale-[0.99] cursor-pointer"
-                  >
-                    <Download size={16} /> Save file to this device {downloadTriggered ? "(Download again)" : ""}
-                  </a>
-                  {downloadTriggered && (
+                  {completedFiles.length > 1 && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-primary">
+                        Received {completedFiles.length} file(s)
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleSaveAllFiles}
+                        disabled={isSavingAll}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-xs font-bold text-accent-foreground shadow-sm transition-transform hover:-translate-y-0.5 disabled:opacity-50"
+                      >
+                        <Download size={13} /> {isSavingAll ? "Saving…" : "Save all files"}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="space-y-2.5 max-h-[340px] overflow-y-auto pr-1">
+                    {completedFiles.map((item, idx) => {
+                      const isSaved = savedFileNames.has(item.fileName);
+                      return (
+                        <div
+                          key={`${item.fileName}-${idx}`}
+                          className="flex flex-col gap-3 rounded-xl border border-border/80 bg-secondary/50 p-4 transition-colors hover:border-accent/40 sm:flex-row sm:items-center sm:justify-between"
+                        >
+                          <div className="flex min-w-0 items-center gap-3">
+                            <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-card text-primary shadow-sm">
+                              <Package size={18} />
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-bold text-primary" title={item.fileName}>
+                                {item.fileName}
+                              </p>
+                              <div className="mt-0.5 flex items-center gap-2 font-mono-ui text-[11px] text-muted-foreground">
+                                <span>{formatBytes(item.fileSize)}</span>
+                                {item.verified ? (
+                                  <span className="inline-flex items-center gap-0.5 text-emerald-400 font-semibold">
+                                    <ShieldCheck size={12} /> Verified
+                                  </span>
+                                ) : (
+                                  <span className="text-amber-400">Ready</span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => handleSaveFile(item)}
+                            className={`inline-flex shrink-0 min-h-10 items-center justify-center gap-2 rounded-xl px-4 text-xs font-bold transition-all shadow-sm active:scale-[0.98] ${
+                              isSaved
+                                ? "bg-secondary text-primary border border-border"
+                                : "bg-primary text-background hover:-translate-y-0.5"
+                            }`}
+                          >
+                            {isSaved ? (
+                              <>
+                                <Check size={14} className="text-emerald-400" /> Saved (Tap to re-save)
+                              </>
+                            ) : (
+                              <>
+                                <Download size={14} /> Save to device
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {savedFileNames.size > 0 && (
                     <p className="text-center font-mono-ui text-[11px] text-emerald-400">
-                      ✓ Download initiated! Check your browser’s downloads or notification bar.
+                      ✓ File saved! Check your downloads or Photos app.
                     </p>
                   )}
                 </div>
               )}
-
-              {completedFile?.verified && (
-                <StatusMessage tone="success">
-                  <ShieldCheck size={15} className="mt-0.5 shrink-0" />
-                  File verified with SHA-256.
-                </StatusMessage>
-              )}
             </div>
           )}
 
-          {statusMessage && (!completedFile || status === "complete") && (
+          {statusMessage && (completedFiles.length === 0 || status === "complete") && (
             <StatusMessage tone={status === "error" ? "error" : status === "complete" ? "success" : "quiet"}>
               <Radio size={14} className="mt-0.5 shrink-0" />
               {statusMessage}

@@ -19,17 +19,6 @@ self.onmessage = async (e) => {
       const root = await navigator.storage.getDirectory();
       currentFileName = msg.name;
 
-      // Clean up previous temporary session files to avoid filling origin storage quota
-      if (typeof root.entries === "function") {
-        try {
-          for await (const [name] of root.entries()) {
-            if (name && name.startsWith("sf_") && name !== msg.name) {
-              await root.removeEntry(name).catch(() => {});
-            }
-          }
-        } catch {}
-      }
-
       const fileHandle = await root.getFileHandle(msg.name, { create: true });
       if (typeof fileHandle.createSyncAccessHandle !== "function") {
         throw new Error("createSyncAccessHandle is not supported in this browser");
@@ -41,6 +30,19 @@ self.onmessage = async (e) => {
       uncommittedBytes = 0;
 
       self.postMessage({ cmd: "init-done", ok: true });
+
+      // Clean up previous temporary session files in background without blocking init
+      setTimeout(async () => {
+        try {
+          if (typeof root.entries === "function") {
+            for await (const [name] of root.entries()) {
+              if (name && name.startsWith("sf_") && name !== msg.name) {
+                await root.removeEntry(name).catch(() => {});
+              }
+            }
+          }
+        } catch {}
+      }, 1000);
     } catch (err) {
       self.postMessage({ cmd: "init-done", ok: false, err: String(err) });
     }

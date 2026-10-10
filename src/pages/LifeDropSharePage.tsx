@@ -60,26 +60,31 @@ export function LifeDropSharePage() {
   useEffect(() => {
     if (!session || fileItems.length === 0) return;
 
-    // For the WebRTC transfer, we use the first file item
-    // In future, multi-file transfer can be implemented
-    const firstFileItem = fileItems[0];
-    if (!firstFileItem?.fileRef) return;
+    const filesToSend = fileItems.map((i) => i.fileRef).filter(Boolean) as File[];
+    if (filesToSend.length === 0) return;
+
+    const totalBytes = filesToSend.reduce((acc, f) => acc + f.size, 0);
 
     const activeSession: ActiveSession = {
       sessionId: session.sessionId,
       token: session.token,
       otp: session.otp,
-      fileName: session.fileName,
-      fileSize: session.fileSize,
-      fileType: session.fileType,
+      fileName: filesToSend.length === 1 ? filesToSend[0].name : session.fileName,
+      fileSize: totalBytes || session.fileSize,
+      fileType: filesToSend.length === 1 ? (filesToSend[0].type || "application/octet-stream") : "application/octet-stream",
       signalingPath: session.signalingPath,
       expiresAt: session.expiresAt,
+      files: filesToSend.map((f) => ({
+        fileName: f.name,
+        fileSize: f.size,
+        fileType: f.type || "application/octet-stream",
+      })),
     };
 
     const client = startPeerConnection({
       session: activeSession,
       role: "sender",
-      file: firstFileItem.fileRef,
+      files: filesToSend,
       onEvent: (evt) => {
         if (evt.type === "status") {
           setStatus(evt.status);
