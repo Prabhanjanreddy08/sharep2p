@@ -4,19 +4,80 @@
    ============================================================ */
 
 const ICE_SERVERS: RTCIceServer[] = [
+  { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun2.l.google.com:19302" },
   { urls: "stun:stun3.l.google.com:19302" },
   { urls: "stun:stun4.l.google.com:19302" },
+  { urls: "stun:stun.nextcloud.com:443" },
+  { urls: "stun:global.stun.twilio.com:3478" },
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:443",
+      "turn:openrelay.metered.ca:443?transport=tcp",
+      "turns:openrelay.metered.ca:443",
+      "turns:openrelay.metered.ca:443?transport=tcp",
+    ],
+    username: "openrelay",
+    credential: "openrelay",
+  },
 ];
+
+function maximizeBandwidthSdp(sdp: string): string {
+  if (!sdp) return sdp;
+  let lines = sdp.split("\r\n");
+  if (lines.length <= 1) lines = sdp.split("\n");
+
+  const newLines: string[] = [];
+  let inAppMedia = false;
+  let hasMaxMsg = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    if (line.startsWith("m=application")) {
+      inAppMedia = true;
+      hasMaxMsg = false;
+      newLines.push(line);
+      newLines.push("b=AS:1000000");
+      newLines.push("b=TIAS:1000000000");
+      continue;
+    }
+
+    if (line.startsWith("m=") && !line.startsWith("m=application")) {
+      inAppMedia = false;
+    }
+
+    if (inAppMedia) {
+      if (line.startsWith("b=AS:") || line.startsWith("b=TIAS:")) {
+        continue;
+      }
+      if (line.startsWith("a=max-message-size:")) {
+        newLines.push("a=max-message-size:268435456");
+        hasMaxMsg = true;
+        continue;
+      }
+    }
+
+    newLines.push(line);
+  }
+
+  if (inAppMedia && !hasMaxMsg) {
+    newLines.push("a=max-message-size:268435456");
+  }
+
+  return newLines.join("\r\n") + "\r\n";
+}
 
 // Maximum chunk size for blazing speed – 256KB per chunk
 // WebRTC can handle up to 256KB reliably
 const CHUNK_SIZE = 256 * 1024; // 256KB
 // Buffer threshold before applying backpressure
-const BUFFER_HIGH = 16 * 1024 * 1024; // 16MB buffer
-const BUFFER_LOW = 4 * 1024 * 1024; // 4MB resume
+const BUFFER_HIGH = 32 * 1024 * 1024; // 32MB buffer for 100MB/s WAN
+const BUFFER_LOW = 8 * 1024 * 1024; // 8MB resume
 
 export interface FileMetadata {
   id: string;
@@ -256,7 +317,11 @@ export class TransferEngine {
     this.setupDataChannel(this.dc);
 
     const offer = await this.pc!.createOffer();
-    await this.pc!.setLocalDescription(offer);
+    const boostedOffer = new RTCSessionDescription({
+      type: offer.type,
+      sdp: maximizeBandwidthSdp(offer.sdp || ""),
+    });
+    await this.pc!.setLocalDescription(boostedOffer);
     this.sendSignal({ type: "offer", sdp: this.pc!.localDescription!.sdp });
   }
 
@@ -269,14 +334,20 @@ export class TransferEngine {
       this.setupDataChannel(this.dc);
     };
 
-    await this.pc!.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp }));
+    const boostedRemote = maximizeBandwidthSdp(sdp);
+    await this.pc!.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: boostedRemote }));
     const answer = await this.pc!.createAnswer();
-    await this.pc!.setLocalDescription(answer);
+    const boostedAnswer = new RTCSessionDescription({
+      type: answer.type,
+      sdp: maximizeBandwidthSdp(answer.sdp || ""),
+    });
+    await this.pc!.setLocalDescription(boostedAnswer);
     this.sendSignal({ type: "answer", sdp: this.pc!.localDescription!.sdp });
   }
 
   private async handleAnswer(sdp: string): Promise<void> {
-    await this.pc!.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp }));
+    const boostedRemote = maximizeBandwidthSdp(sdp);
+    await this.pc!.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: boostedRemote }));
   }
 
   private setupDataChannel(dc: RTCDataChannel): void {

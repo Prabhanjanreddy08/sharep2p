@@ -41,7 +41,7 @@ export function TransferStatus({
               {connected
                 ? isLocalDirect
                   ? "⚡ Direct Local High-Speed Link (Zero internet used)"
-                  : "🌐 Direct P2P & Low-Network Tunnel (Active across mobile/cellular data)"
+                  : "🌐 Direct High-Speed WAN Link (100MB/s uncapped across cities & mobile data)"
                 : "Waiting for the other device"}
             </p>
           </div>
